@@ -34,7 +34,7 @@ $ ./build.sh x64                            # for linux-x86_64
 $ ./build.sh cuda                           # for linux-x86_64_cuda
 ```
 ### Contact Us
-
+*vv
 * [OpenPPL](https://openppl.ai/)
 * [Github issues](https://github.com/openppl-public/ppl.cv/issues)
 
