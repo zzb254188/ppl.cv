@@ -23,7 +23,6 @@
 #include <cmath>
 #include <float.h>
 #include "string.h"
-#include "typetraits.hpp"
 #include <arm_neon.h>
 #include "ppl/common/log.h"
 #include "common.hpp"
@@ -33,245 +32,200 @@ namespace ppl {
 namespace cv {
 namespace aarch64 {
 
-
-#define p(x) LOG(INFO) << " "#x;vprint<nc, v_dt>(x);
-           
-
-inline void stq(float *dst, float32x4_t t) {vst1q_f32(dst, t);}
-inline void stq(float *dst, float32x4x3_t t) {vst3q_f32(dst, t);}
-inline void stq(float *dst, float32x4x4_t t) {vst4q_f32(dst, t);}
-
-template<int nc, typename T>
-void vprint(T t){
-    float32_t data[4*nc] = {};
-    stq(data, t);
-    for(int i = 0; i < nc; i++){
-        for(int j = 0; j < 4; j++){
-            std::cout << data[i*4 + j] << " ";
-        }
-    }
-    std::cout << std::endl;
-}
-
-template<int nc, typename T, typename V>
-inline void vdupq(T &src, V value) {
-    for(int i = 0; i < nc; i++){
-        src.val[i] = vdupq_n_f32(value);
-    }
-}
-
-template <>
-inline void vdupq<1, float32x4_t, float>(float32x4_t &src, float value) {
-    src = vdupq_n_f32(value);
-}
-
-
-template<int nc, typename T>
-inline void vldnq(T& src, const float *ptr);
-
-template <>
-inline void vldnq<1, float32x4_t>(float32x4_t& src, const float *ptr){src = vld1q_f32(ptr);}
-
-template <>
-inline void vldnq<3, float32x4x3_t>(float32x4x3_t& src, const float *ptr){src = vld3q_f32(ptr);}
-
-template <>
-inline void vldnq<4, float32x4x4_t>(float32x4x4_t& src, const float *ptr){src = vld4q_f32(ptr);}
-
-template <class morphOp, int32_t nc, typename T>
-inline void compare(T& tnext, T& v_up, T& v_mid, T& v_down)
-{
-    morphOp vop;
-    for(int32_t i = 0; i < nc; i++) {
-        tnext.val[i] = vop(vop(v_up.val[i], v_mid.val[i]), v_down.val[i]);
-    }
-}
-
-template <>
-inline void compare<DilateVecOp, 1, float32x4_t>(float32x4_t& tnext, float32x4_t& v_up, float32x4_t& v_mid, float32x4_t& v_down)
-{
-    DilateVecOp vop;
-    tnext = vop(vop(v_up, v_mid), v_down);
-}
-
-template <>
-inline void compare<ErodeVecOp, 1, float32x4_t>(float32x4_t& tnext, float32x4_t& v_up, float32x4_t& v_mid, float32x4_t& v_down)
-{
-    ErodeVecOp vop;
-    tnext = vop(vop(v_up, v_mid), v_down);
-}
-
-template <int32_t nc, typename T>
-inline void vextq(T& t1, T& t2, T& t3, int n)
-{
-    for(int32_t i = 0; i < nc; i++) {
-        t1.val[i] = vextq_f32(t2.val[i], t3.val[i], n);
-    }
-}
-
-template <>
-inline void vextq<1, float32x4_t>(float32x4_t& t1, float32x4_t& t2, float32x4_t& t3, int n)
-{
-    t1 = vextq_f32(t2, t3, n);
-}
-
-
 #define VLEN 16 // 16 bytes = 128 bits for  reg
 template <typename T>
 inline T *getRowPtr(T *base, int32_t stride, int32_t row)
 {
-    float *baseRaw = const_cast<float *>(reinterpret_cast<const float *>(base));
+    T *baseRaw = const_cast<T *>(reinterpret_cast<const T *>(base));
     return reinterpret_cast<T *>(baseRaw + row * stride);
 }
 
-template <class morphOp, int32_t nc, int32_t kernel_len>
-inline void MorphRow(typename DT<nc, float>::vec_DT *tprev, typename DT<nc, float>::vec_DT &tcurr, typename DT<nc, float>::vec_DT *tnext, const float *srcCenterRow, int32_t srcStride, float *drow, int32_t rowIdx, int32_t rowIdxInv, int32_t colIdx, int32_t colIdxInv, float borderValue = 0)
+template <class morphOp, typename T, int32_t nc, int32_t kernel_len>
+inline void MorphRow(float32x4_t *tprev, float32x4_t &tcurr, float32x4_t *tnext, const T *srcCenterRow, int32_t srcStride, T *drow, int32_t rowIdx, int32_t rowIdxInv, int32_t colIdx, int32_t colIdxInv, T borderValue = 0)
 {
-    using v_dt = typename DT<nc, float>::vec_DT;
-    using cmpptr = void (*)(v_dt&, v_dt&, v_dt&, v_dt&);
-    cmpptr vop = compare<morphOp, nc, v_dt>;
-    using vldptr = void (*)(v_dt&, const float*);
-    vldptr vld = vldnq<nc, v_dt>;
-    v_dt v_border;
-    vdupq<nc, v_dt, float>(v_border, borderValue);
-    constexpr int32_t kernel_radius   = (kernel_len - 1) / 2;
-    constexpr int32_t radius_vec_num  = kernel_radius;
-    constexpr int32_t v_elem          = VLEN / sizeof(float);
-    constexpr int8_t invalid_byte_len = VLEN % (nc * sizeof(float));
+    constexpr int32_t v_elem         = VLEN / sizeof(T);
+    constexpr int32_t kernel_radius  = (kernel_len - 1) / 2;
+    constexpr int32_t radius_vec_num = (nc * kernel_radius - 1) / v_elem + 1;
+    
+    float32x4_t v_border = vdupq_n_f32(borderValue);
+    morphOp vop;
     switch (kernel_len) {
         case 3: {
-            v_dt v_up, v_mid, v_down;
-            v_dt t_left, t_mid, t_right;
-            if(rowIdx == 0){v_up = v_border;}else{vldnq<nc, v_dt>(v_up, srcCenterRow - srcStride);};
-            vldnq<nc, v_dt>(v_mid, srcCenterRow);
-            if(rowIdxInv == 0){v_down = v_border;}else{vldnq<nc, v_dt>(v_down, srcCenterRow + srcStride);};
+            float32x4_t v_up, v_mid, v_down;
+            float32x4_t t_left, t_mid, t_right;
+            v_up = rowIdx == 0 ? v_border : vld1q_f32(srcCenterRow - srcStride);
+            v_mid = vld1q_f32(srcCenterRow);
+            v_down = rowIdxInv == 0 ? v_border: vld1q_f32(srcCenterRow + srcStride);
 
-            compare<morphOp, nc, v_dt>(tnext[0], v_up, v_mid, v_down);
+            tnext[0] = vop(vop(v_up, v_mid), v_down);
+            if(nc == 4){
+                t_left = tprev[0];
+                t_mid = tcurr;
+                t_right = tnext[0];
+            } else {
+                t_left = vextq_f32(tprev[0], tcurr, VLEN/sizeof(T) - nc); 
+                t_mid = tcurr;
+                t_right = vextq_f32(tcurr, tnext[0], nc);
+            }
 
-            vextq<nc, v_dt>(t_left, tprev[0], tcurr, 3); 
-            t_mid = tcurr;
-            vextq<nc, v_dt>(t_right, tcurr, tnext[0], 1);
-            
-            compare<morphOp, nc, v_dt>(t_mid, t_left, t_mid, t_right);
-            stq(drow, t_mid);
+            t_mid = vop(vop(t_left, t_mid), t_right);
+            vst1q_f32(drow, t_mid);
         } break;
         case 5: {
-            v_dt v_up0, v_up1, v_mid, v_down0, v_down1;
-            if(rowIdx < 2){v_up0 = v_border;}else{vldnq<nc, v_dt>(v_up0, srcCenterRow - 2 * srcStride + v_elem * nc * (radius_vec_num - 1));};
-            if(rowIdx < 1){v_up1 = v_border;}else{vldnq<nc, v_dt>(v_up1, srcCenterRow - 1 * srcStride + v_elem * nc * (radius_vec_num - 1));};
-            vldnq<nc, v_dt>(v_mid, srcCenterRow + v_elem * nc * (radius_vec_num - 1));
-            if(rowIdxInv < 1){v_down0 = v_border;}else{vldnq<nc, v_dt>(v_down0, srcCenterRow + 1 * srcStride + v_elem * nc * (radius_vec_num - 1));};
-            if(rowIdxInv < 2){v_down1 = v_border;}else{vldnq<nc, v_dt>(v_down1, srcCenterRow + 2 * srcStride + v_elem * nc * (radius_vec_num - 1));};
-            vop(tnext[radius_vec_num - 1], v_up0, v_up1, v_mid);
-            vop(tnext[radius_vec_num - 1], tnext[radius_vec_num - 1], v_down0, v_down1);
+            float32x4_t v_up0, v_up1, v_mid, v_down0, v_down1;
+            v_up0   = rowIdx < 2 ? v_border : vld1q_f32(srcCenterRow - 2 * srcStride + v_elem * (radius_vec_num - 1));
+            v_up1   = rowIdx < 1 ? v_border : vld1q_f32(srcCenterRow - 1 * srcStride + v_elem * (radius_vec_num - 1));
+            v_mid   = vld1q_f32(srcCenterRow + v_elem * (radius_vec_num - 1));
+            v_down0 = rowIdxInv < 1 ? v_border : vld1q_f32(srcCenterRow + 1 * srcStride + v_elem * (radius_vec_num - 1));
+            v_down1 = rowIdxInv < 2 ? v_border : vld1q_f32(srcCenterRow + 2 * srcStride + v_elem * (radius_vec_num - 1));
 
-            v_dt t_left0, t_left1, t_mid, t_right0, t_right1;
-            vextq<nc, v_dt>(t_left0, tprev[1], tcurr, 2); 
-            vextq<nc, v_dt>(t_left1, tprev[1], tcurr, 3); 
-            t_mid = tcurr;
-            vextq<nc, v_dt>(t_right0, tcurr, tnext[0], 1);
-            vextq<nc, v_dt>(t_right1, tcurr, tnext[0], 2);
+            tnext[radius_vec_num - 1] = vop(vop(v_up0, vop(v_up1, v_mid)), vop(v_down0, v_down1));;
+
+            float32x4_t t_left0, t_left1, t_mid, t_right0, t_right1;
             
-            vop(t_mid, t_mid, t_left0, t_left1);
-            vop(t_mid, t_mid, t_right0, t_right1);
-            stq(drow, t_mid);
+            if(nc == 4){
+                t_left0  = tprev[0];
+                t_left1  = tprev[1];
+                t_mid    = tcurr;
+                t_right0 = colIdxInv < 4 ? v_border : tnext[0];
+                t_right1 = colIdxInv < 4 ? v_border : tnext[1];
+            } else if(nc == 3) {
+                t_left0 = vextq_f32(tprev[0], tprev[1], 2); 
+                t_left1 = vextq_f32(tprev[1], tcurr, 1); 
+                t_mid = tcurr;
+                t_right0 = vextq_f32(tcurr, tnext[0], 3);
+                t_right1 = vextq_f32(tnext[0], tnext[1], 2);
+            } else {
+                t_left0 = vextq_f32(tprev[0], tcurr, 2); 
+                t_left1 = vextq_f32(tprev[0], tcurr, 3); 
+                t_mid = tcurr;
+                t_right0= vextq_f32(tcurr, tnext[0], 1);
+                t_right1= vextq_f32(tcurr, tnext[0], 2);
+            }
+
+           t_mid = vop(vop(vop(t_left0, t_left1), t_mid), vop(t_right0, t_right1));
+
+            vst1q_f32(drow, t_mid);
         } break;
         default:
             break;
     }
 }
 
-template <class morphOp, int32_t nc, int32_t kernel_len>
-inline void MorphRowLast(typename DT<nc, float>::vec_DT *tprev, typename DT<nc, float>::vec_DT &tcurr, typename DT<nc, float>::vec_DT *tnext, const float *srcCenterRow, int32_t srcStride, float *drow, int32_t rowIdx, int32_t rowIdxInv, int32_t colIdx, int32_t colIdxInv, float borderValue = 0)
+template <class morphOp, typename T, int32_t nc, int32_t kernel_len>
+inline void MorphRowLast(float32x4_t *tprev, float32x4_t &tcurr, float32x4_t *tnext, const T *srcCenterRow, int32_t srcStride, T *drow, int32_t rowIdx, int32_t rowIdxInv, int32_t colIdx, int32_t colIdxInv, float borderValue = 0)
 {
-    using v_dt = typename DT<nc, float>::vec_DT;
-    using cmpptr = void (*)(v_dt&, v_dt&, v_dt&, v_dt&);
-    cmpptr vop = compare<morphOp, nc, v_dt>;
-    using vldptr = void (*)(v_dt&, const float*);
-    vldptr vld = vldnq<nc, v_dt>;
-    v_dt v_border;
-    vdupq<nc, v_dt, float>(v_border, borderValue);
-    constexpr int32_t kernel_radius   = (kernel_len - 1) / 2;
-    constexpr int32_t radius_vec_num  = kernel_radius;
-    constexpr int32_t v_elem          = VLEN / sizeof(float) / nc;
-    constexpr int8_t invalid_byte_len = VLEN % (nc * sizeof(float));
+    float32x4_t v_border = vdupq_n_f32(borderValue);
+    morphOp vop;
+    constexpr int32_t v_elem         = VLEN / sizeof(T);
+    constexpr int32_t kernel_radius  = (kernel_len - 1) / 2;
+    constexpr int32_t radius_vec_num = (nc * kernel_radius - 1) / v_elem + 1;
     int32_t bias = colIdxInv + 1;
     switch (kernel_len) {
         case 3: {
-            v_dt v_up, v_mid, v_down;
-            v_dt t_left, t_mid, t_right;
-            tnext[0] = v_border;
-            v_dt F_min;
-            vdupq<nc, v_dt, float>(F_min, FLT_MIN);
-            if(bias == 3){
-                vextq<nc, v_dt>(t_left, tprev[0], tcurr, 2);
-                vextq<nc, v_dt>(t_mid, tprev[0], tcurr, 3);
-                vextq<nc, v_dt>(t_right, t_mid, v_border, 1);
-            } else if(bias == 2) {
-                vextq<nc, v_dt>(t_left, tprev[0], tcurr, 1);
-                vextq<nc, v_dt>(t_mid, tprev[0], tcurr, 2);
-                vextq<nc, v_dt>(t_right, t_mid, v_border, 1);
-            } else if (bias == 1) {
-                vextq<nc, v_dt>(t_left, tprev[0], tcurr, 0);
-                vextq<nc, v_dt>(t_mid, tprev[0], tcurr, 1);
-                vextq<nc, v_dt>(t_right, t_mid, v_border, 1);
+            int32_t lane = bias % 4;
+            float32x4_t v_up, v_mid, v_down, t_last;
+            v_up   = rowIdx < 1 ? v_border : vld1q_f32(srcCenterRow - srcStride);
+            v_mid   = vld1q_f32(srcCenterRow + v_elem * (radius_vec_num - 1));
+            v_down = rowIdxInv < 1 ? v_border : vld1q_f32(srcCenterRow + srcStride);
+
+            t_last = vop(vop(v_up, v_mid), v_down);
+
+            if(lane==3) t_last = vsetq_lane_f32(borderValue, t_last, 3);
+            if(lane==2) {t_last = vsetq_lane_f32(borderValue, t_last, 3);t_last = vsetq_lane_f32(borderValue, t_last, 2);};
+            if(lane==1) {t_last = vsetq_lane_f32(borderValue, t_last, 3);t_last = vsetq_lane_f32(borderValue, t_last, 2);t_last = vsetq_lane_f32(borderValue, t_last, 1);};
+            float32x4_t t_left, t_mid, t_right, t_res;
+            if(nc == 4){
+                t_left = tcurr;
+                t_mid = tnext[0];
+                t_right = t_last;
             } else {
-                if(rowIdx == 0){v_up = v_border;}else{vldnq<nc, v_dt>(v_up, srcCenterRow - nc * 2 * 4 - nc - srcStride);};
-                vldnq<nc, v_dt>(v_mid, srcCenterRow - nc * 2 * 4 - nc);
-                if(rowIdxInv == 0){v_down = v_border;}else{vldnq<nc, v_dt>(v_down, srcCenterRow - nc * 2 * 4 - nc + srcStride);};
-                compare<morphOp, nc, v_dt>(t_left, v_up, v_mid, v_down);
-                vextq<nc, v_dt>(t_mid, tprev[0], tcurr, 0);
-                vextq<nc, v_dt>(t_right, t_mid, v_border, 1);
+                t_left = vextq_f32(tcurr, tnext[0], VLEN/sizeof(T) - nc); 
+                t_mid = tnext[0];
+                t_right = vextq_f32(tnext[0], t_last, nc);
             }
-            compare<morphOp, nc, v_dt>(t_mid, t_left, t_mid, t_right);
-            stq(drow - (4 - bias) * nc, t_mid);
+
+            t_res = vop(vop(t_left, t_mid), t_right);
+            vst1q_f32(drow, t_res);
+            if(nc == 4){
+                t_left = tnext[0];
+                t_mid = t_last;
+                t_right = v_border;
+            } else {
+                t_left = vextq_f32(tnext[0], t_last, VLEN/sizeof(T) - nc); 
+                t_mid = t_last;
+                t_right = vextq_f32(t_last, v_border, nc);
+            } 
+                    
+            t_mid = vop(vop(t_left, t_mid), t_right);
+
+            if(lane==3) t_res = vextq_f32(t_res, t_mid, 3);
+            if(lane==2) t_res = vextq_f32(t_res, t_mid, 2);
+            if(lane==1) t_res = vextq_f32(t_res, t_mid, 1);
+            if(lane==0) {t_res = t_mid; lane = 4;}
+            vst1q_f32(drow + lane, t_res);
         } break;
         case 5: {
-            v_dt v_up0, v_up1, v_mid, v_down0, v_down1;
-            v_dt t_left0, t_left1, t_mid, t_right0, t_right1;
+            int32_t lane = bias % 4;
+            float32x4_t v_up0, v_up1, v_mid, v_down0, v_down1, t_last;
+            v_up0   = rowIdx < 2 ? v_border : vld1q_f32(srcCenterRow - 2 * srcStride + v_elem * (radius_vec_num - 1));
+            v_up1   = rowIdx < 1 ? v_border : vld1q_f32(srcCenterRow - 1 * srcStride + v_elem * (radius_vec_num - 1));
+            v_mid   = vld1q_f32(srcCenterRow + v_elem * (radius_vec_num - 1));
+            v_down0 = rowIdxInv < 1 ? v_border : vld1q_f32(srcCenterRow + 1 * srcStride + v_elem * (radius_vec_num - 1));
+            v_down1 = rowIdxInv < 2 ? v_border : vld1q_f32(srcCenterRow + 2 * srcStride + v_elem * (radius_vec_num - 1));
 
-            tnext[0] = v_border;
-            v_dt F_min;
-            vdupq<nc, v_dt, float>(F_min, FLT_MIN);
-            if(bias == 3){
-                vextq<nc, v_dt>(t_left0, tprev[1], tcurr, 1);
-                vextq<nc, v_dt>(t_left1, tprev[1], tcurr, 2);
-                vextq<nc, v_dt>(t_mid, tprev[1], tcurr, 3);
-                vextq<nc, v_dt>(t_right0, t_mid, v_border, 1);
-                vextq<nc, v_dt>(t_right1, t_mid, v_border, 2);
+            t_last = vop(vop(v_up0, vop(v_up1, v_mid)), vop(v_down0, v_down1));;
+            if(lane==3) t_last = vsetq_lane_f32(borderValue, t_last, 3);
+            if(lane==2) {t_last = vsetq_lane_f32(borderValue, t_last, 3);t_last = vsetq_lane_f32(borderValue, t_last, 2);};
+            if(lane==1) {t_last = vsetq_lane_f32(borderValue, t_last, 3);t_last = vsetq_lane_f32(borderValue, t_last, 2);t_last = vsetq_lane_f32(borderValue, t_last, 1);};
+            float32x4_t t_left0, t_left1, t_mid, t_right0, t_right1, t_res; 
 
-            } else if(bias == 2) {
-                vextq<nc, v_dt>(t_left0, tprev[1], tcurr, 0);
-                vextq<nc, v_dt>(t_left1, tprev[1], tcurr, 1);
-                vextq<nc, v_dt>(t_mid, tprev[1], tcurr, 2);
-                vextq<nc, v_dt>(t_right0, t_mid, v_border, 1);
-                vextq<nc, v_dt>(t_right1, t_mid, v_border, 2);
-            } else if (bias == 1) {
-                vextq<nc, v_dt>(t_left0, tprev[0], tprev[1], 3);
-                vextq<nc, v_dt>(t_left1, tprev[1], tcurr, 0);
-                vextq<nc, v_dt>(t_mid, tprev[1], tcurr, 1);
-                vextq<nc, v_dt>(t_right0, t_mid, v_border, 1);
-                vextq<nc, v_dt>(t_right1, t_mid, v_border, 2);
-            } else {
-                // p(tprev[0])
-                // p(tprev[1])
-                // p(tcurr)
-                vextq<nc, v_dt>(t_left0, tprev[0], tprev[1], 2);
-                vextq<nc, v_dt>(t_left1, tprev[0], tprev[1], 3);
-                t_mid = tprev[1];
-                // vextq<nc, v_dt>(t_mid, tprev[1], tcurr, 3);
-                vextq<nc, v_dt>(t_right0, t_mid, v_border, 1);
-                vextq<nc, v_dt>(t_right1, t_mid, v_border, 2);
-                // p(t_left0)
-                // p(t_left1)
-                // p(t_mid)
-                // p(t_right0)
-                // p(t_right1)
+            float32x4_t vnext[4] = {t_last, v_border, v_border, v_border};
+            for(int j = 0; j < 1 + radius_vec_num; j++){
+                for (int32_t i = 1; i < radius_vec_num; i++) {
+                tprev[i - 1] = tprev[i];
+                }
+                tprev[radius_vec_num - 1] = tcurr;
+                tcurr                     = tnext[0];
+                for (int32_t i = 1; i < radius_vec_num; i++) {
+                    tnext[i - 1] = tnext[i];
+                }
+                tnext[radius_vec_num - 1] = vnext[j]; 
+                {
+                    if(nc == 4){
+                        t_left0  = tprev[0];
+                        t_left1  = tprev[1];
+                        t_mid    = tcurr;
+                        t_right0 = tnext[0];
+                        t_right1 = tnext[1];
+                    } else if(nc == 3) {
+                        t_left0 = vextq_f32(tprev[0], tprev[1], 2); 
+                        t_left1 = vextq_f32(tprev[1], tcurr, 1); 
+                        t_mid = tcurr;
+                        t_right0 = vextq_f32(tcurr, tnext[0], 3);
+                        t_right1 = vextq_f32(tnext[0], tnext[1], 2);
+                    } else {
+                        t_left0 = vextq_f32(tprev[0], tcurr, 2); 
+                        t_left1 = vextq_f32(tprev[0], tcurr, 3); 
+                        t_mid = tcurr;
+                        t_right0 = vextq_f32(tcurr, tnext[0], 1);
+                        t_right1 = vextq_f32(tcurr, tnext[0], 2);
+                    }
+                    t_mid = vop(vop(vop(t_left0, t_left1), t_mid), vop(t_right0, t_right1));
+                }
+                if(j!=radius_vec_num){
+                    t_res = t_mid;
+                    vst1q_f32(drow, t_res);
+                    drow += v_elem;
+                }
+                else{
+                    if(lane==3) t_res = vextq_f32(t_res, t_mid, 3);
+                    if(lane==2) t_res = vextq_f32(t_res, t_mid, 2);
+                    if(lane==1) t_res = vextq_f32(t_res, t_mid, 1);
+                    if(lane==0) {t_res = t_mid; lane = 4;}
+                    vst1q_f32(drow - v_elem + lane, t_res);
+                }
             }
-            vop(t_mid, t_mid, t_left0, t_left1);
-            vop(t_mid, t_mid, t_right0, t_right1);
-
-            stq(drow - (4 - bias) * nc, t_mid);
         } break;
         default:
             break;
@@ -279,40 +233,34 @@ inline void MorphRowLast(typename DT<nc, float>::vec_DT *tprev, typename DT<nc, 
 }
 
 template <class morphOp, int32_t nc, int32_t kernel_len>
-inline void MorphFirstCol(typename DT<nc, float>::vec_DT &tcurr, typename DT<nc, float>::vec_DT *tnext, const float *srcCenterRow, int32_t srcStride, int32_t rowIdx, int32_t rowIdxInv, float borderValue = 0)
+inline void MorphFirstCol(float32x4_t &tcurr, float32x4_t *tnext, const float *srcCenterRow, int32_t srcStride, int32_t rowIdx, int32_t rowIdxInv, float borderValue = 0)
 {
-    using v_dt = typename DT<nc, float>::vec_DT;
-    using cmpptr = void (*)(v_dt&, v_dt&, v_dt&, v_dt&);
-    cmpptr vop = compare<morphOp, nc, v_dt>;
-    using vldptr = void (*)(v_dt&, const float*);
-    vldptr vld = vldnq<nc, v_dt>;
-    v_dt v_border;
-    vdupq<nc, v_dt, float>(v_border, borderValue);
+    constexpr int32_t v_elem         = VLEN / sizeof(float32_t);
     constexpr int32_t kernel_radius  = (kernel_len - 1) / 2;
-    constexpr int32_t radius_vec_num = kernel_radius;
-    constexpr int32_t v_elem         = VLEN / sizeof(float);
+    constexpr int32_t radius_vec_num = (nc * kernel_radius - 1) / v_elem + 1;
 
+    float32x4_t v_border = vdupq_n_f32(borderValue);
+    morphOp vop;
     switch (kernel_len) {
         case 3: {
-            v_dt v_up, v_mid, v_down;
-            if(rowIdx == 0){v_up = v_border;}else{vld(v_up, srcCenterRow - srcStride);};
-            vld(v_mid, srcCenterRow);
-            if(rowIdxInv == 0){v_down = v_border;}else{vld(v_down, srcCenterRow + srcStride);};
-            vop(tnext[0], v_up, v_mid, v_down);
-            tcurr    = v_border;
+            float32x4_t v_up, v_mid, v_down;
+            v_up = rowIdx < 1 ? v_border : vld1q_f32(srcCenterRow - srcStride);
+            v_mid = vld1q_f32(srcCenterRow);
+            v_down = rowIdxInv < 1 ? v_border: vld1q_f32(srcCenterRow + srcStride);
+            tnext[0] = vop(vop(v_up, v_mid), v_down);
+            tcurr = v_border;
         } break;
         case 5: {
-            for (int32_t i = 0; i < radius_vec_num; i++) {
-                v_dt v_up0, v_up1, v_mid, v_down0, v_down1;
-                
-                if(rowIdx < 2){v_up0 = v_border;}else{vld(v_up0, srcCenterRow - 2 * srcStride + v_elem * nc * i);};
-                if(rowIdx < 1){v_up1 = v_border;}else{vld(v_up1, srcCenterRow - 1 * srcStride + v_elem * nc * i);};
-                vld(v_mid, srcCenterRow + v_elem * nc * i);
-                if(rowIdxInv < 1){v_down0 = v_border;}else{vld(v_down0, srcCenterRow + 1 * srcStride + v_elem * nc * i);};
-                if(rowIdxInv < 2){v_down1 = v_border;}else{vld(v_down1, srcCenterRow + 2 * srcStride + v_elem * nc * i);};
-                vop(tnext[i], v_up0, v_up1, v_mid);
-                vop(tnext[i], tnext[i], v_down0, v_down1);
-            }
+            float32x4_t v_up0, v_up1, v_mid, v_down0, v_down1;
+    
+            for(int i = 0; i < radius_vec_num; i++) {
+                v_up0 = rowIdx < 2 ? v_border : vld1q_f32(srcCenterRow - 2 * srcStride + i * v_elem);
+                v_up1 = rowIdx < 1 ? v_border : vld1q_f32(srcCenterRow - 1 * srcStride + i * v_elem);
+                v_mid = vld1q_f32(srcCenterRow + i * v_elem);
+                v_down0 = rowIdxInv < 1 ? v_border: vld1q_f32(srcCenterRow + 1 * srcStride + i * v_elem);
+                v_down1 = rowIdxInv < 2 ? v_border: vld1q_f32(srcCenterRow + 2 * srcStride + i * v_elem);
+                tnext[i] = vop(vop(v_up0, vop(v_up1, v_mid)), vop(v_down0, v_down1));
+            } 
             tcurr = v_border;
         } break;
         default:
@@ -331,24 +279,26 @@ void morph_f32(
     BorderType border_type,
     float borderValue)
 {
-    constexpr int32_t kernel_radius  = (kernel_len - 1) / 2;
     constexpr int32_t v_elem         = VLEN / sizeof(float);
-    constexpr int32_t radius_vec_num = kernel_radius;
-    using v_dt = typename DT<nc, float>::vec_DT;
-    v_dt tcurr, tprev[radius_vec_num], tnext[radius_vec_num], v_border;
-    vdupq<nc, v_dt, float>(v_border, borderValue);
+    constexpr int32_t kernel_radius  = (kernel_len - 1) / 2;
+    constexpr int32_t radius_vec_num = (nc * kernel_radius - 1) / v_elem + 1;
+    float32x4_t tcurr, tprev[radius_vec_num], tnext[radius_vec_num];
+    float32x4_t v_border = vdupq_n_f32(borderValue);
 
-    prefetch(srcBase);
+
     for(int y = 0; y < height; y++){
         const float *srow = getRowPtr(srcBase, srcStride, y);
         float *drow       = getRowPtr(dstBase, dstStride, y);
-        prefetch(srow);
-        prefetch(srow + srcStride);
-        prefetch(drow);
         MorphFirstCol<morphOp, nc, kernel_len>(tcurr, tnext, srow, srcStride, y, height - 1 - y, borderValue);
-        int32_t x = v_elem;
-        for (; x <= width ; x += v_elem) {
-            // shift
+        tprev[radius_vec_num - 1] = v_border;
+        int32_t x = v_elem; 
+        for(int i = 0; i < nc; i++){
+            prefetch(srow + (i + 1) * srcStride);
+            prefetch(srow - (i + 1) * srcStride);
+        }
+        prefetch(srow);
+        prefetch(drow);
+        for (; x < width * nc - v_elem * radius_vec_num; x += v_elem) {
             for (int32_t i = 1; i < radius_vec_num; i++) {
                 tprev[i - 1] = tprev[i];
             }
@@ -357,21 +307,10 @@ void morph_f32(
             for (int32_t i = 1; i < radius_vec_num; i++) {
                 tnext[i - 1] = tnext[i];
             }
-            MorphRow<morphOp, nc, kernel_len>(tprev, tcurr, tnext, srow + x * nc, srcStride, drow, y, height - 1 - y, x - v_elem, width - 1 - (x - v_elem), borderValue);
-            
-            drow += v_elem * nc;
+            MorphRow<morphOp, float, nc, kernel_len>(tprev, tcurr, tnext, srow + x, srcStride, drow, y, height - 1 - y, x - v_elem, width * nc - 1 - (x - v_elem), borderValue);
+            drow += v_elem;
         }
-        if (x - v_elem <= width) {
-            for (int32_t i = 1; i < radius_vec_num; i++) {
-                tprev[i - 1] = tprev[i];
-            }
-            tprev[radius_vec_num - 1] = tcurr;
-            tcurr                     = tnext[0];
-            for (int32_t i = 1; i < radius_vec_num; i++) {
-                tnext[i - 1] = tnext[i];
-            }
-            MorphRowLast<morphOp, nc, kernel_len>(tprev, tcurr, tnext, srow + x * nc, srcStride, drow, y, height - 1 - y, x - v_elem, width - 1 - (x - v_elem), borderValue);
-        }
+        MorphRowLast<morphOp, float, nc, kernel_len>(tprev, tcurr, tnext, srow + x, srcStride, drow, y, height - 1 - y, x - v_elem, width * nc - 1 - (x - v_elem), borderValue);
     }
 }
 
@@ -484,8 +423,6 @@ template void morph_f32<ErodeVecOp, 4, 5>(
     float *dstBase,
     BorderType border_type,
     float borderValue);
-
 }
 }
 } // namespace ppl::cv::aarch64
-

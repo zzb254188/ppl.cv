@@ -22,6 +22,7 @@
 #include <cmath>
 #include <float.h>
 #include <random>
+#include <iostream>
 
 template<typename T, int32_t nc>
 inline void checkResult(const T *data1,

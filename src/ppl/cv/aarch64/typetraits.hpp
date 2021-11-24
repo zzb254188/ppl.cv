@@ -15,22 +15,22 @@ struct DT;
 template <>
 struct DT<1, unsigned char>
 {
-    typedef uint8x8_t vec_DT;
+    typedef uint8x16_t vec_DT;
 };
 template <>
 struct DT<2, unsigned char>
 {
-    typedef uint8x8x2_t vec_DT;
+    typedef uint8x16x2_t vec_DT;
 };
 template <>
 struct DT<3, unsigned char>
 {
-    typedef uint8x8x3_t vec_DT;
+    typedef uint8x16x3_t vec_DT;
 };
 template <>
 struct DT<4, unsigned char>
 {
-    typedef uint8x8x4_t vec_DT;
+    typedef uint8x16x4_t vec_DT;
 };
 template <>
 struct DT<1, float>

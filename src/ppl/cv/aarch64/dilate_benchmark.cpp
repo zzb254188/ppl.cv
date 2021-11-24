@@ -24,18 +24,18 @@
 
 namespace {
 
-template<typename T, int32_t nc>
+template<typename T, int32_t nc, int32_t kernel_size>
 void BM_Dilate_ppl_aarch64(benchmark::State &state) {
     int32_t width = state.range(0);
     int32_t height = state.range(1);
     std::unique_ptr<T[]> src(new T[width * height * nc]);
     std::unique_ptr<T[]> dst(new T[width * height * nc]);
-    std::unique_ptr<unsigned char[]> kernel(new unsigned char[3 * 3]);
-    memset(kernel.get(), 1, 3 * 3);
+    std::unique_ptr<unsigned char[]> kernel(new unsigned char[kernel_size * kernel_size]);
+    memset(kernel.get(), 1, kernel_size * kernel_size);
 
     ppl::cv::debug::randomFill<T>(src.get(), width * height * nc, 0, 1);
     for (auto _ : state) {
-        ppl::cv::aarch64::Dilate<T, nc>(height, width, width * nc, src.get(), 3, 3, kernel.get(),                                
+        ppl::cv::aarch64::Dilate<T, nc>(height, width, width * nc, src.get(), kernel_size, kernel_size, kernel.get(),                                
                                                             width * nc, dst.get(), ppl::cv::BORDER_TYPE_CONSTANT, 0);
     }
     state.SetItemsProcessed(state.iterations() * 1);
@@ -43,15 +43,23 @@ void BM_Dilate_ppl_aarch64(benchmark::State &state) {
 
 using namespace ppl::cv::debug;
 
-BENCHMARK_TEMPLATE(BM_Dilate_ppl_aarch64, float, c1)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
-BENCHMARK_TEMPLATE(BM_Dilate_ppl_aarch64, float, c3)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
-BENCHMARK_TEMPLATE(BM_Dilate_ppl_aarch64, float, c4)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
-// BENCHMARK_TEMPLATE(BM_Dilate_ppl_aarch64, uint8_t, c1)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
-// BENCHMARK_TEMPLATE(BM_Dilate_ppl_aarch64, uint8_t, c3)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
-// BENCHMARK_TEMPLATE(BM_Dilate_ppl_aarch64, uint8_t, c4)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_ppl_aarch64, float, c1, k3x3)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_ppl_aarch64, float, c3, k3x3)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_ppl_aarch64, float, c4, k3x3)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_ppl_aarch64, float, c1, k5x5)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_ppl_aarch64, float, c3, k5x5)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_ppl_aarch64, float, c4, k5x5)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+
+
+BENCHMARK_TEMPLATE(BM_Dilate_ppl_aarch64, uchar, c1, k3x3)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_ppl_aarch64, uchar, c3, k3x3)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_ppl_aarch64, uchar, c4, k3x3)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_ppl_aarch64, uchar, c1, k5x5)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_ppl_aarch64, uchar, c3, k5x5)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_ppl_aarch64, uchar, c4, k5x5)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
 
 #ifdef PPLCV_BENCHMARK_OPENCV
-template<typename T, int32_t nc>
+template<typename T, int32_t nc, int32_t kernel_size>
 void BM_Dilate_opencv_aarch64(benchmark::State &state) {
     int32_t width = state.range(0);
     int32_t height = state.range(1);
@@ -60,9 +68,9 @@ void BM_Dilate_opencv_aarch64(benchmark::State &state) {
     ppl::cv::debug::randomFill<T>(src.get(), width * height * nc, 0, 255);
     cv::Mat iMat(height, width, CV_MAKETYPE(cv::DataType<T>::depth, nc), src.get(), sizeof(T) * width * nc);
     cv::Mat oMat(height, width, CV_MAKETYPE(cv::DataType<T>::depth, nc), dst.get(), sizeof(T) * width * nc);
-    std::unique_ptr<unsigned char[]> kernel(new unsigned char[3 * 3]);
-    memset(kernel.get(), 1, 3 * 3);
-    cv::Mat eleMat(3, 3, CV_MAKETYPE(CV_8U, 1), kernel.get());
+    std::unique_ptr<unsigned char[]> kernel(new unsigned char[kernel_size * kernel_size]);
+    memset(kernel.get(), 1, kernel_size * kernel_size);
+    cv::Mat eleMat(kernel_size, kernel_size, CV_MAKETYPE(CV_8U, 1), kernel.get());
 
     for (auto _ : state) {
         cv::dilate(iMat, oMat, eleMat);
@@ -70,11 +78,21 @@ void BM_Dilate_opencv_aarch64(benchmark::State &state) {
     state.SetItemsProcessed(state.iterations() * 1);
 }
 
-BENCHMARK_TEMPLATE(BM_Dilate_opencv_aarch64, float, 1)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
-BENCHMARK_TEMPLATE(BM_Dilate_opencv_aarch64, float, 3)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
-BENCHMARK_TEMPLATE(BM_Dilate_opencv_aarch64, float, 4)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
-// BENCHMARK_TEMPLATE(BM_Dilate_opencv_aarch64, uint8_t, 1)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
-// BENCHMARK_TEMPLATE(BM_Dilate_opencv_aarch64, uint8_t, 3)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
-// BENCHMARK_TEMPLATE(BM_Dilate_opencv_aarch64, uint8_t, 4)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_opencv_aarch64, float, c1, k3x3)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_opencv_aarch64, float, c3, k3x3)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_opencv_aarch64, float, c4, k3x3)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_opencv_aarch64, float, c1, k5x5)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_opencv_aarch64, float, c3, k5x5)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_opencv_aarch64, float, c4, k5x5)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+
+
+BENCHMARK_TEMPLATE(BM_Dilate_opencv_aarch64, uchar, c1, k3x3)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_opencv_aarch64, uchar, c3, k3x3)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_opencv_aarch64, uchar, c4, k3x3)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_opencv_aarch64, uchar, c1, k5x5)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_opencv_aarch64, uchar, c3, k5x5)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+BENCHMARK_TEMPLATE(BM_Dilate_opencv_aarch64, uchar, c4, k5x5)->Args({320, 240})->Args({640, 480})->Args({1280, 720})->Args({1920, 1080})->Args({3840, 2160});
+
+
 #endif //! PPLCV_BENCHMARK_OPENCV
 }

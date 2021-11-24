@@ -15,15 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "ppl/cv/aarch64/morph.hpp"
+#include "ppl/cv/aarch64/erode.h"
+#include "morph.hpp"
 #include "ppl/cv/aarch64/test.h"
 #include <opencv2/imgproc.hpp>
 #include <memory>
-#include <iostream>
 #include <gtest/gtest.h>
 #include "ppl/cv/debug.h"
-
-using namespace ppl::cv::aarch64;
+#include <iostream>
 
 template<typename T, int val>
 static void randomRangeData(T *data, const size_t num,int maxNum =255){
@@ -35,31 +34,32 @@ static void randomRangeData(T *data, const size_t num,int maxNum =255){
     }
 }
 
-template <typename T, int32_t nc, int32_t kernel_size>
-class Morph : public ::testing::TestWithParam<std::tuple<int, int, int, float>> {
+template <typename T, int32_t nc>
+class Erode : public ::testing::TestWithParam<std::tuple<int, int, int, int, float>> {
 public:
-    using MorphParam = std::tuple<int, int, int, float>;
-    Morph()
+    using ErodeParam = std::tuple<int, int, int, int, float>;
+    Erode()
     {
     }
 
-    ~Morph()
+    ~Erode()
     {
     }
 
-    void apply(const MorphParam &param) {
+    void apply(const ErodeParam &param) {
         int width = std::get<0>(param);
         int height = std::get<1>(param);
-        int borderType = std::get<2>(param);
-        float diff = std::get<3>(param);
+        int kernel_size = std::get<2>(param);
+        int borderType = std::get<3>(param);
+        float diff = std::get<4>(param);
 
         std::unique_ptr<T[]> src(new T[width * height * nc]);
         std::unique_ptr<T[]> dst_ref(new T[width * height * nc]);
         std::unique_ptr<T[]> dst(new T[width * height * nc]);
         std::unique_ptr<uchar[]> kernel(new uchar[kernel_size * kernel_size]);
-        ppl::cv::debug::randomFill<T>(src.get(), width * height * nc, 0, 10);
-        ppl::cv::debug::randomFill<T>(dst.get(), width * height * nc, 0, 0);
-        ppl::cv::debug::randomFill<T>(dst_ref.get(), width * height * nc, 0, 255);
+        ppl::cv::debug::randomFill<T>(src.get(), width * height * nc, 0, 255);
+        ppl::cv::debug::randomFill<T>(dst.get(), width * height * nc, 1, 1);
+        ppl::cv::debug::randomFill<T>(dst_ref.get(), width * height * nc, 1, 1);
         ppl::cv::debug::randomFill<uchar>(kernel.get(), kernel_size * kernel_size, 1, 1);
         memcpy(dst.get(), dst_ref.get(), width * height * nc * sizeof(T));
         cv::Mat src_opencv(height, width, CV_MAKETYPE(cv::DataType<T>::depth, nc), src.get(), sizeof(T) * width * nc);
@@ -67,37 +67,48 @@ public:
         cv::Mat kernel_opencv(kernel_size, kernel_size, CV_8U, kernel.get());
 
         T border_value;
-        ppl::cv::debug::randomFill<T>(&border_value, 1, 0, 10);
+        ppl::cv::debug::randomFill<T>(&border_value, 1, 0, 255);
         cv::Scalar borderValue = {border_value, border_value, border_value, border_value};
 
         cv::erode(src_opencv, dst_opencv, kernel_opencv, cv::Point(-1,-1), 1, borderType, borderValue);
-        ppl::cv::aarch64::morph_f32<ErodeVecOp, nc, kernel_size>(
+
+        ppl::cv::aarch64::Erode<T, nc>(
             height,
             width,
             width * nc,
             src.get(),
+            kernel_size,
+            kernel_size,
+            kernel.get(),
             width * nc,
             dst.get(),
             (ppl::cv::BorderType)borderType,
             border_value);
 
+        
+        // for(int i = 0 ; i < height; i++){
+        //     for (int j = 0; j < width * nc; j++){
+        //         if (*(dst.get() + i * width * nc + j) != *(dst_ref.get() + i * width * nc + j))
+        //             std::cout << i <<"," << j << std::endl;
+        //         // std::cout << *(dst.get() + i * width * nc + j) << " ";
+        //     }
+        //     // std::cout<<std::endl;   
+        // }
+
         // std::cout<<std::endl;   
         // for(int i = 0 ; i < height; i++){
         //     for (int j = 0; j < width * nc; j++){
-        //         std::cout << *(dst.get() + i * width * nc + j) << " ";
+        //         std::cout << static_cast<int>(*(dst.get() + i * width * nc + j)) << " ";
         //     }
         //     std::cout<<std::endl;   
-        // }
-        
-        // std::cout<<std::endl;   
-        // for(int i = 0 ; i < height; i++){
         //     for (int j = 0; j < width * nc; j++){
-        //         std::cout << *(dst_ref.get() + i * width * nc + j) << " ";
+        //         // std::cout << static_cast<int>(*(dst_ref.get() + i * width * nc + j)) << " ";
         //     }
         //     std::cout<<std::endl;   
         // }
 
-            checkResult<T, nc>(
+
+        checkResult<T, nc>(
             dst_ref.get(),
             dst.get(),
             height,
@@ -108,30 +119,24 @@ public:
     };
 };
 
-#define R1(name, t, c, kernel_size, diff)\
-    using name = Morph<t, c, kernel_size>;\
+#define R1(name, t, c, diff)\
+    using name = Erode<t, c>;\
     TEST_P(name, abc)\
     {\
         this->apply(GetParam());\
     }\
     INSTANTIATE_TEST_CASE_P(standard, name,\
-        ::testing::Combine(::testing::Values(8,9,10,11,12,13,14,15,16,17), \
+        ::testing::Combine(::testing::Values(240, 241,242,243,244,245,246,247,248,249,230,231,232,233,234), \
                            ::testing::Values(10), \
-                           ::testing::Values(ppl::cv::BORDER_TYPE_CONSTANT),\
+                           ::testing::Values(3, 5), \
+                           ::testing::Values(ppl::cv::BORDER_TYPE_CONSTANT, ppl::cv::BORDER_TYPE_REFLECT,\
+                                             ppl::cv::BORDER_TYPE_REFLECT101, ppl::cv::BORDER_TYPE_REPLICATE),\
                            ::testing::Values(diff)));
 
-R1(morph_f8c1k3, float, 1, 3, 1.01)
-R1(morph_f8c3k3, float, 3, 3, 1.01)
-R1(morph_f8c4k3, float, 4, 3, 1.01)
+R1(Erode_f32c1, float, 1, 1.01)
+R1(Erode_f32c3, float, 3, 1.01)
+R1(Erode_f32c4, float, 4, 1.01)
 
-R1(morph_f8c1k5, float, 1, 5, 1.01)
-R1(morph_f8c3k5, float, 3, 5, 1.01)
-R1(morph_f8c4k5, float, 4, 5, 1.01)
-
-// R1(morph_u8c1k3, uint8_t, 1, 3, 1.01)
-// R1(morph_u8c3k3, uint8_t, 3, 3, 1.01)
-// R1(morph_u8c4k3, uint8_t, 4, 3, 1.01)
-
-// R1(morph_u8c1k5, uint8_t, 1, 5, 1.01)
-// R1(morph_u8c3k5, uint8_t, 3, 5, 1.01)
-// R1(morph_u8c4k5, uint8_t, 4, 5, 1.01)
+R1(Erode_u8c1, uint8_t, 1, 1.01)
+R1(Erode_u8c3, uint8_t, 3, 1.01)
+R1(Erode_u8c4, uint8_t, 4, 1.01)

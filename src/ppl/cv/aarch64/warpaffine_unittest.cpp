@@ -32,7 +32,7 @@ static void randomRangeData(T *data, const size_t num,int maxNum =255){
     }
 }
 
-template <typename T, int32_t nc>
+template <typename T, ppl::cv::InterpolationType inter_mode, int32_t nc>
 class WarpAffine : public ::testing::TestWithParam<std::tuple<int, int, int, float>> {
 public:
     using WarpAffineParam = std::tuple<int, int, int, float>;
@@ -68,22 +68,42 @@ public:
         ppl::cv::debug::randomFill<T>(&border_value, 1, 0, 255);
 
         cv::Scalar borderValue = {border_value, border_value, border_value, border_value};
-        cv::warpAffine(src_opencv, dst_opencv, affineMatrix_opencv, dst_opencv.size(), 17/*CV_WARP_INVERSE_MAP + CV_INTER_LINEAR*/, 
-            borderType, borderValue);
+        
+        if(inter_mode == ppl::cv::INTERPOLATION_TYPE_LINEAR){
+            cv::warpAffine(src_opencv, dst_opencv, affineMatrix_opencv, dst_opencv.size(), 17/*CV_WARP_INVERSE_MAP + CV_INTER_LINEAR*/, 
+                borderType, borderValue);
 
-        ppl::cv::aarch64::WarpAffineLinear<T, nc>(
-            height,
-            width,
-            width * nc,
-            src.get(),
-            height,
-            width,
-            width * nc,
-            dst.get(),
-            affineMatrix.get(),
-            (ppl::cv::BorderType)borderType,
-            border_value);
+            ppl::cv::aarch64::WarpAffineLinear<T, nc>(
+                height,
+                width,
+                width * nc,
+                src.get(),
+                height,
+                width,
+                width * nc,
+                dst.get(),
+                affineMatrix.get(),
+                (ppl::cv::BorderType)borderType,
+                border_value);
+        }
+        if(inter_mode == ppl::cv::INTERPOLATION_TYPE_NEAREST_POINT){
+            cv::warpAffine(src_opencv, dst_opencv, affineMatrix_opencv, dst_opencv.size(), cv::WARP_INVERSE_MAP|cv::INTER_NEAREST, 
+                borderType, borderValue);
 
+            ppl::cv::aarch64::WarpAffineNearestPoint<T, nc>(
+                height,
+                width,
+                width * nc,
+                src.get(),
+                height,
+                width,
+                width * nc,
+                dst.get(),
+                affineMatrix.get(),
+                (ppl::cv::BorderType)borderType,
+                border_value);
+        }
+        
         checkResult<T, nc>(
             dst_ref.get(),
             dst.get(),
@@ -95,23 +115,28 @@ public:
     };
 };
 
-#define R1(name, t, c, diff)\
-    using name = WarpAffine<t, c>;\
+#define R1(name, t, inter_mode, c, diff)\
+    using name = WarpAffine<t, inter_mode, c>;\
     TEST_P(name, abc)\
     {\
         this->Linearapply(GetParam());\
     }\
     INSTANTIATE_TEST_CASE_P(standard, name,\
-        ::testing::Combine(::testing::Values(2, 2), \
-                           ::testing::Values(4, 4), \
-                           ::testing::Values(ppl::cv::BORDER_TYPE_CONSTANT),\
+        ::testing::Combine(::testing::Values(512,320,640,1280,1920,3840), \
+                           ::testing::Values(512,240,480,720,1080,2060), \
+                           ::testing::Values(ppl::cv::BORDER_TYPE_CONSTANT, ppl::cv::BORDER_TYPE_REPLICATE, ppl::cv::BORDER_TYPE_TRANSPARENT),\
                            ::testing::Values(diff)));
 
-R1(WarpAffineLinear_f8c1, float, 1, 1e-2)
-R1(WarpAffineLinear_f8c3, float, 3, 1e-2)
-R1(WarpAffineLinear_f8c4, float, 4, 1e-2)
+R1(WarpAffineLinear_f32c1, float, ppl::cv::INTERPOLATION_TYPE_LINEAR, 1, 1.01)
+R1(WarpAffineLinear_f32c3, float, ppl::cv::INTERPOLATION_TYPE_LINEAR, 3, 1.01)
+R1(WarpAffineLinear_f32c4, float, ppl::cv::INTERPOLATION_TYPE_LINEAR, 4, 1.01)
+R1(WarpAffineNearest_f32c1, float, ppl::cv::INTERPOLATION_TYPE_NEAREST_POINT, 1, 1.01)
+R1(WarpAffineNearest_f32c3, float, ppl::cv::INTERPOLATION_TYPE_NEAREST_POINT, 3, 1.01)
+R1(WarpAffineNearest_f32c4, float, ppl::cv::INTERPOLATION_TYPE_NEAREST_POINT, 4, 1.01)
 
-R1(WarpAffineLinear_u8c1, uint8_t, 1, 1.01)
-R1(WarpAffineLinear_u8c2, uint8_t, 2, 1.01)
-R1(WarpAffineLinear_u8c3, uint8_t, 3, 1.01)
-R1(WarpAffineLinear_u8c4, uint8_t, 4, 1.01)
+R1(WarpAffineLinear_u8c1, uchar, ppl::cv::INTERPOLATION_TYPE_LINEAR, 1, 1.01)
+R1(WarpAffineLinear_u8c3, uchar, ppl::cv::INTERPOLATION_TYPE_LINEAR, 3, 1.01)
+R1(WarpAffineLinear_u8c4, uchar, ppl::cv::INTERPOLATION_TYPE_LINEAR, 4, 1.01)
+R1(WarpAffineNearest_u8c1, uchar, ppl::cv::INTERPOLATION_TYPE_NEAREST_POINT, 1, 1.01)
+R1(WarpAffineNearest_u8c3, uchar, ppl::cv::INTERPOLATION_TYPE_NEAREST_POINT, 3, 1.01)
+R1(WarpAffineNearest_u8c4, uchar, ppl::cv::INTERPOLATION_TYPE_NEAREST_POINT, 4, 1.01)

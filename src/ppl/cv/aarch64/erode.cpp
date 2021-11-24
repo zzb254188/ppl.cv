@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "ppl/cv/aarch64/dilate.h"
+#include "ppl/cv/aarch64/erode.h"
 #include "ppl/common/log.h"
 #include "ppl/cv/types.h"
 #include "ppl/common/sys.h"
@@ -31,12 +31,12 @@ namespace ppl {
 namespace cv {
 namespace aarch64 {
 
-::ppl::common::RetCode armmaxFilter_f(int height, int width, int inWidthStride,
+::ppl::common::RetCode armminFilter_f(int height, int width, int inWidthStride,
     const float* inData, int kernelx_len, int kernely_len,
     int outWidthStride, float* outData, int cn, float border_value){
-    float minimal = -FLT_MAX;
+    float minimal = FLT_MAX;
 
-    float *gRowMax = (float*) malloc(height * inWidthStride * sizeof(float));
+    float *gRowMin = (float*) malloc(height * inWidthStride * sizeof(float));
     int leftPad = cn * (kernely_len >> 1);
     int rightPad = cn * width - leftPad;
     if (!(kernely_len & 1)) rightPad += cn;
@@ -46,29 +46,29 @@ namespace aarch64 {
 
         for (int j = 0; j < leftPad; ++j){
             int yEnd = j - leftPad + cn * kernely_len;
-            float _max = border_value;
+            float _min = border_value;
             for (int jj = j % cn; jj < yEnd; jj += cn)
-                if (inData[inIndex + jj] > _max) _max = inData[inIndex + jj];
-            gRowMax[inIndex + j] = _max;
+                if (inData[inIndex + jj] > _min) _min = inData[inIndex + jj];
+            gRowMin[inIndex + j] = _min;
         }
 
         int j;
         for (j = leftPad; j < rightPad - 4; j += 4){
-            float32x4_t mm_max = vdupq_n_f32(0);
+            float32x4_t mm_min = vdupq_n_f32(0);
             for (int jj = j - leftPad; jj < j - leftPad + cn * kernely_len; jj += cn){
                 float32x4_t mm_temp = vld1q_f32(inData + inIndex + jj);
-                mm_max = vmaxq_f32(mm_max, mm_temp);
+                mm_min = vminq_f32(mm_min, mm_temp);
             }
-            vst1q_f32(gRowMax + inIndex + j, mm_max);
+            vst1q_f32(gRowMin + inIndex + j, mm_min);
         }
         for (; j < width * cn; ++j){
             int yStart = j - leftPad;
-            float _max = (j < rightPad)? minimal : border_value;
+            float _min = (j < rightPad)? minimal : border_value;
             int yEnd = yStart + cn * kernely_len;
             yEnd = std::min<int>(yEnd, width * cn);
             for (int jj = yStart; jj < yEnd; jj += cn)
-                if (inData[inIndex + jj] > _max) _max = inData[inIndex + jj];
-            gRowMax[inIndex + j] = _max;
+                if (inData[inIndex + jj] > _min) _min = inData[inIndex + jj];
+            gRowMin[inIndex + j] = _min;
         }
     }
 
@@ -81,43 +81,43 @@ namespace aarch64 {
         int xEnd = xStart + kernelx_len;
         bool valid = (xStart >= 0) && (xEnd <= height);
         xEnd = std::min<int>(xEnd, height);
-        xStart = std::max<int>(xStart, 0);
+        xStart = std::min<int>(xStart, 0);
         int j = 0;
         for (; j < width * cn - 4; j += 4){
-            float32x4_t mm_max = vdupq_n_f32(valid? minimal : border_value);
+            float32x4_t mm_min = vdupq_n_f32(valid? minimal : border_value);
             for (int ii = xStart; ii < xEnd; ++ii){
-                float32x4_t mm_temp = vld1q_f32(gRowMax + ii * inWidthStride + j);
-                mm_max = vmaxq_f32(mm_temp, mm_max);
+                float32x4_t mm_temp = vld1q_f32(gRowMin + ii * inWidthStride + j);
+                mm_min = vminq_f32(mm_temp, mm_min);
             }
-            vst1q_f32(outData + i * outWidthStride + j, mm_max);
+            vst1q_f32(outData + i * outWidthStride + j, mm_min);
         }
         for (; j < width * cn; ++j){
-            float _max = valid? minimal : border_value;
+            float _min = valid? minimal : border_value;
             for (int ii = xStart; ii < xEnd; ++ii){
-                if (gRowMax[ii * inWidthStride + j] > _max) _max = gRowMax[ii * inWidthStride + j];
+                if (gRowMin[ii * inWidthStride + j] > _min) _min = gRowMin[ii * inWidthStride + j];
             }
-            outData[i * outWidthStride + j] = _max;
+            outData[i * outWidthStride + j] = _min;
         }
     }
 
-    free(gRowMax);
+    free(gRowMin);
     return ppl::common::RC_SUCCESS;
 }
 
 template<typename T>
-::ppl::common::RetCode armmaxFilter_normal(int height, int width, int inWidthStride, 
+::ppl::common::RetCode armminFilter_normal(int height, int width, int inWidthStride, 
     const T* inData, int kernelx_len, int kernely_len, const uchar* kernel, 
     int outWidthStride, T* outData, int cn, T border_value){
     T minimal;
     if (std::is_same<T, float>::value) {
-        minimal = -FLT_MAX;
+        minimal = FLT_MAX;
     } else if (std::is_same<T, uchar>::value) {
-        minimal = 0;
+        minimal = 255;
     }
     for (int i = 0; i < height; ++i) {
         for (int j = 0; j < width; ++j) {
             for (int c = 0; c < cn; ++c) {
-                T _max = minimal;
+                T _min = minimal;
                 for (int ky = 0; ky < kernely_len; ++ky) {
                     int src_y = i + ky - (kernely_len >> 1);
                     bool valid_y = ((src_y >= 0) && (src_y < height));
@@ -126,19 +126,19 @@ template<typename T>
                         bool valid_x = ((src_x >= 0) && (src_x < width));
                         if (kernel[ky * kernelx_len + kx]) {
                             T value =  (valid_x && valid_y)? inData[src_y * inWidthStride + src_x * cn + c] : border_value;
-                            _max = std::max(_max, value);
+                            _min = std::min(_min, value);
                         }
                     }
                 }
-                outData[i * outWidthStride + j * cn + c] = _max;
+                outData[i * outWidthStride + j * cn + c] = _min;
             }
         }
     }
     return ppl::common::RC_SUCCESS;
 }
-#define Dilate(dt, nc, name) \
+#define Erode(dt, nc, name) \
 template<>\
-::ppl::common::RetCode Dilate<dt, nc>(int height, int width, int inWidthStride,\
+::ppl::common::RetCode Erode<dt, nc>(int height, int width, int inWidthStride,\
     const dt* inData, int kernelx_len, int kernely_len, const uchar* kernel,\
     int outWidthStride, dt* outData, BorderType border_type, dt border_value){\
     assert(inData != NULL);\
@@ -146,7 +146,7 @@ template<>\
     assert(kernel != NULL);\
     assert(height != 0 && width != 0 && inWidthStride != 0 && outWidthStride != 0);\
     if (border_type != BORDER_TYPE_CONSTANT) {\
-        border_value = std::numeric_limits<dt>::lowest();\
+        border_value = std::numeric_limits<dt>::max();\
     }\
     bool flag = true, flag3 = false, flag5 = false;\
     if (kernelx_len == 3 && kernely_len == 3)\
@@ -159,21 +159,21 @@ template<>\
             break;\
         }\
     }\
-    if (flag && flag3) ppl::cv::aarch64::morph_##name<DilateVecOp, nc, 3>(height, width, inWidthStride, inData, \
+    if (flag && flag3) ppl::cv::aarch64::morph_##name<ErodeVecOp, nc, 3>(height, width, inWidthStride, inData, \
                                                                     outWidthStride, outData, ppl::cv::BORDER_TYPE_CONSTANT, border_value);\
-    else if (flag && flag5) ppl::cv::aarch64::morph_##name<DilateVecOp, nc, 5>(height, width, inWidthStride, inData, \
+    else if (flag && flag5) ppl::cv::aarch64::morph_##name<ErodeVecOp, nc, 5>(height, width, inWidthStride, inData, \
                                                                     outWidthStride, outData, ppl::cv::BORDER_TYPE_CONSTANT, border_value);\
-    else return armmaxFilter_normal(height, width, inWidthStride, inData, kernelx_len, kernely_len,\
+    else return armminFilter_normal(height, width, inWidthStride, inData, kernelx_len, kernely_len,\
         kernel, outWidthStride, outData, nc, border_value);\
 }
 
-Dilate(float, 1, f32)
-Dilate(float, 3, f32)
-Dilate(float, 4, f32)
+Erode(float, 1, f32)
+Erode(float, 3, f32)
+Erode(float, 4, f32)
 
-Dilate(uchar, 1, u8)
-Dilate(uchar, 3, u8)
-Dilate(uchar, 4, u8)
+Erode(uchar, 1, u8)
+Erode(uchar, 3, u8)
+Erode(uchar, 4, u8)
 
 }
 }

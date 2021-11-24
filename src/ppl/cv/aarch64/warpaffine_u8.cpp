@@ -32,6 +32,27 @@ namespace ppl {
 namespace cv {
 namespace aarch64 {
 
+template<typename _Tp> static inline _Tp* alignPtr(_Tp* ptr, int n=(int)sizeof(_Tp)) {    return (_Tp*)(((size_t)ptr + n-1) & -n);}
+
+template <typename T>
+inline T *getRowPtr(T *base, int32_t stride, int32_t row)
+{
+    T *baseRaw = const_cast<T *>(reinterpret_cast<const T *>(base));
+    return reinterpret_cast<T *>(baseRaw + row * stride);
+}
+
+template<typename T>
+inline const T round(const T &a, const T &b)
+{
+    return a / b * b;
+}
+
+template<typename T>
+inline const T round_up(const T &a, const T &b)
+{
+    return (a + b - static_cast<T>(1)) / b * b;
+}
+
 const int AB_BITS = 10;
 const int AB_SCALE = 1 << AB_BITS;
 const int INTER_BITS = 5;
@@ -113,78 +134,263 @@ static void initInterTab2D()
     delete[] _tab;
 }
 
-template<typename T>
-void warpAffine_nearest(T *dst, const T *src, 
-	int inHeight, int inWidth, int inWidthStride, 
+template<typename T, int cn>
+::ppl::common::RetCode warpAffine_nearest(
+    T *dst, const T *src, 
+    int inHeight, int inWidth, int inWidthStride, 
     int outHeight, int outWidth, int outWidthStride, 
-    const float *M, int cn, int borderMode, uchar borderValue = 0) {
+    const float *M, int borderMode, float borderValue = 0.0f)
+{
+    const int BLOCK_SIZE = 32;
+    int _map[BLOCK_SIZE * BLOCK_SIZE + 32];
+    int * map = alignPtr(_map, 16);
 
     int round_delta = AB_SCALE >> 1;
+
+    int32x4_t v_width4 = vdupq_n_s32(outWidth - 1), v_height4 = vdupq_n_s32(outHeight - 1);
+    int32x4_t v_step4 = vdupq_n_s32(outWidthStride);
+    float32x4_t v_4 = vdupq_n_f32(4.0f);
+
+    float32x4_t v_m0 = vdupq_n_f32(M[0]);
+    float32x4_t v_m1 = vdupq_n_f32(M[1]);
+    float32x4_t v_m2 = vdupq_n_f32(M[2]);
+    float32x4_t v_m3 = vdupq_n_f32(M[3]);
+    float32x4_t v_m4 = vdupq_n_f32(M[4]);
+    float32x4_t v_m5 = vdupq_n_f32(M[5]);
+
     int *adelta = (int *) malloc(outWidth * sizeof(int));
     int *bdelta = (int *) malloc(outWidth * sizeof(int));
     for (int x = 0; x < outWidth; ++x) {
         adelta[x] = rint(M[0] * x * AB_SCALE);
         bdelta[x] = rint(M[3] * x * AB_SCALE);
     }
-    for (int i = 0; i < outHeight; ++i) {
-        int X0 = rint((M[1] * i + M[2]) * AB_SCALE) + round_delta;
-        int Y0 = rint((M[4] * i + M[5]) * AB_SCALE) + round_delta;
-        for (int j = 0; j < outWidth; ++j) {
-            int srcX = (X0 + adelta[j]) >> AB_BITS;
-            int srcY = (Y0 + bdelta[j]) >> AB_BITS;
-            int dstIndex = i * outWidthStride + j * cn;
-            
-            if(borderMode == BORDER_TYPE_CONSTANT){
-                if (srcX >= 0 && srcX < inWidth && srcY >= 0 && srcY < inHeight) {
-                    int srcIndex = srcY * inWidthStride + srcX * cn;
-                    for (int k = 0; k < cn; ++k) {
-                        dst[dstIndex + k] = src[srcIndex + k];
-                    }
-                } else {
-                    for (int k = 0; k < cn; ++k) {
-                        dst[dstIndex + k] = borderValue;
-                    }
-                }
-            }
-            else if(borderMode == BORDER_TYPE_TRANSPARENT)
+
+    if (borderMode == BORDER_TYPE_REPLICATE)
+    {
+        int32x4_t v_zero4 = vdupq_n_s32(0);
+        int32x4_t max_width = vdupq_n_s32(inWidth - 1);
+        int32x4_t max_height = vdupq_n_s32(inHeight - 1);
+        int32x4_t v_cn = vdupq_n_s32(cn);
+        int32x4_t v_inWidthStride = vdupq_n_s32(inWidthStride);
+        int32x4_t v_round_delta = vdupq_n_s32(round_delta);
+        float32x4_t v_AB_SCALE = vdupq_n_f32(AB_SCALE);
+        for (size_t i = 0; i < outHeight; i += BLOCK_SIZE)
+        {
+            size_t blockHeight = std::min<size_t>(BLOCK_SIZE, inHeight - i);
+            for (size_t j = 0; j < outWidth; j += BLOCK_SIZE)
             {
-                if (srcX >= 0 && srcX < inWidth && srcY >= 0 && srcY < inHeight) {
-                    int srcIndex = srcY * inWidthStride + srcX * cn;
-                    for (int k = 0; k < cn; ++k) {
-                        dst[dstIndex + k] = src[srcIndex + k];
+                size_t blockWidth = std::min<size_t>(BLOCK_SIZE, inWidth - j);
+
+                // compute table
+                for (size_t y = 0; y < blockHeight; ++y)
+                {   
+
+                    int * map_row = getRowPtr(&map[0], blockWidth, y);
+                    size_t x = 0, dsty = y + i;
+                    float indeces[4] = { j + 0.0f, j + 1.0f, j + 2.0f, j + 3.0f };
+                    float32x4_t v_x = vld1q_f32(indeces), v_y = vdupq_n_f32(dsty);
+                    float32x4_t v_yx = vmlaq_f32(v_m2, v_m1, v_y), v_yy = vmlaq_f32(v_m5, v_m4, v_y);
+
+                    for ( ; x + 4 <= blockWidth; x += 4)
+                    {
+                        int dstx = x + j;
+                        int32x4_t X0 = vaddq_s32(vcvtq_s32_f32(vmulq_f32(v_yx, v_AB_SCALE)), v_round_delta);
+                        int32x4_t Y0 = vaddq_s32(vcvtq_s32_f32(vmulq_f32(v_yy, v_AB_SCALE)), v_round_delta);
+                        int32x4_t srcX = vshrq_n_s32(vaddq_s32(X0, vld1q_s32(adelta + dstx)), AB_BITS);
+                        int32x4_t srcY = vshrq_n_s32(vaddq_s32(Y0, vld1q_s32(bdelta + dstx)), AB_BITS);
+                        srcX = vminq_s32(vmaxq_s32(srcX, v_zero4), max_width);
+                        srcY = vminq_s32(vmaxq_s32(srcY, v_zero4), max_height);
+                        int32x4_t v_src_index = vmlaq_s32(vmulq_s32(srcY, v_inWidthStride), srcX, v_cn);
+                        vst1q_s32(map_row + x, v_src_index);
                     }
-                } else {
-                    continue;
+                    
+                    for(; x < blockWidth; ++x){
+                        int dstx = x + j; 
+                        int X0 = rint((M[1] * dsty + M[2]) * AB_SCALE) + round_delta;
+                        int Y0 = rint((M[4] * dsty + M[5]) * AB_SCALE) + round_delta;
+                        int srcX = (X0 + adelta[dstx]) >> AB_BITS;
+                        int srcY = (Y0 + bdelta[dstx]) >> AB_BITS;
+                        srcX = clip(srcX, 0, inWidth - 1);
+                        srcY = clip(srcY, 0, inHeight - 1);
+                        map_row[x] = srcY * inWidthStride + srcX * cn;
+                    }
                 }
-            }
-            else if(borderMode == BORDER_TYPE_REPLICATE)
-            {
-                srcX = clip(srcX, 0, inWidth - 1);
-                srcY = clip(srcY, 0, inHeight - 1);
-                int srcIndex = srcY * inWidthStride + srcX * cn;
-                for (int k = 0; k < cn; ++k) {
-                    dst[dstIndex + k] = src[srcIndex + k];
+                for (size_t y = 0; y < blockHeight; ++y)
+                {
+                    const int * map_row = getRowPtr(map, blockWidth, y);
+                    T * dst_row = getRowPtr(dst, outWidthStride, i + y) + j * cn;
+
+                    for (size_t x = 0; x < blockWidth; x++)
+                    {      
+                        int tmp = x * cn;
+                        for(int k = 0; k < cn; ++k){
+                            dst_row[tmp + k] = src[map_row[x] + k];
+                        }
+                    }
                 }
+
             }
         }
     }
-    free(adelta);
-    free(bdelta);
+    else if (borderMode == BORDER_TYPE_CONSTANT)
+    {
+        int32x4_t v_zero4 = vdupq_n_s32(0);
+        int32x4_t v_nega = vdupq_n_s32(-1);
+        int32x4_t max_width = vdupq_n_s32(inWidth - 1);
+        int32x4_t max_height = vdupq_n_s32(inHeight - 1);
+        int32x4_t v_cn = vdupq_n_s32(cn);
+        int32x4_t v_inWidthStride = vdupq_n_s32(inWidthStride);
+        int32x4_t v_round_delta = vdupq_n_s32(round_delta);
+        float32x4_t v_AB_SCALE = vdupq_n_f32(AB_SCALE);
+        for (size_t i = 0; i < outHeight; i += BLOCK_SIZE)
+        {
+            size_t blockHeight = std::min<size_t>(BLOCK_SIZE, inHeight - i);
+            for (size_t j = 0; j < outWidth; j += BLOCK_SIZE)
+            {
+                size_t blockWidth = std::min<size_t>(BLOCK_SIZE, inWidth - j);
+
+                // compute table
+                for (size_t y = 0; y < blockHeight; ++y)
+                {   
+
+                    int * map_row = getRowPtr(&map[0], blockWidth, y);
+                    size_t x = 0, dsty = y + i;
+                    float indeces[4] = { j + 0.0f, j + 1.0f, j + 2.0f, j + 3.0f };
+                    float32x4_t v_x = vld1q_f32(indeces), v_y = vdupq_n_f32(dsty);
+                    float32x4_t v_yx = vmlaq_f32(v_m2, v_m1, v_y), v_yy = vmlaq_f32(v_m5, v_m4, v_y);
+
+                    for ( ; x + 4 <= blockWidth; x += 4)
+                    {
+                        int dstx = x + j;
+                        int32x4_t X0 = vaddq_s32(vcvtq_s32_f32(vmulq_f32(v_yx, v_AB_SCALE)), v_round_delta);
+                        int32x4_t Y0 = vaddq_s32(vcvtq_s32_f32(vmulq_f32(v_yy, v_AB_SCALE)), v_round_delta);
+                        int32x4_t srcX = vshrq_n_s32(vaddq_s32(X0, vld1q_s32(adelta + dstx)), AB_BITS);
+                        int32x4_t srcY = vshrq_n_s32(vaddq_s32(Y0, vld1q_s32(bdelta + dstx)), AB_BITS);
+                        uint32x4_t flg0 = vcleq_u32(vreinterpretq_u32_s32(srcX), vreinterpretq_u32_s32(max_width));
+                        uint32x4_t flg1 = vcleq_u32(vreinterpretq_u32_s32(srcY), vreinterpretq_u32_s32(max_height));
+                        flg0 = vandq_u32(flg0, flg1);
+                        int32x4_t v_src_index = vmlaq_s32(vmulq_s32(srcY, v_inWidthStride), srcX, v_cn);
+                        v_src_index = vbslq_s32(flg0, v_src_index, v_nega);
+                        vst1q_s32(map_row + x, v_src_index);
+                    }
+                    
+                    for(; x < blockWidth; ++x){
+                        int dstx = x + j; 
+                        int X0 = rint((M[1] * dsty + M[2]) * AB_SCALE) + round_delta;
+                        int Y0 = rint((M[4] * dsty + M[5]) * AB_SCALE) + round_delta;
+                        int srcX = (X0 + adelta[dstx]) >> AB_BITS;
+                        int srcY = (Y0 + bdelta[dstx]) >> AB_BITS;
+                        if ((unsigned)(srcX - 0) <= (unsigned)(inWidth - 1 - 0) && (unsigned)(srcY - 0) <= (unsigned)(inHeight - 1 - 0))
+                            map_row[x] = srcY * inWidthStride + srcX * cn;
+                        else
+                            map_row[x] = -1;
+                    }
+                }
+                for (size_t y = 0; y < blockHeight; ++y)
+                {
+                    const int * map_row = getRowPtr(map, blockWidth, y);
+                    T * dst_row = getRowPtr(dst, outWidthStride, i + y) + j * cn;
+
+                    for (size_t x = 0; x < blockWidth; x++)
+                    {   
+                        int tmp = x * cn;
+                        for(int k = 0; k < cn; ++k){
+                            dst_row[tmp + k] = map_row[x] >= 0 ? src[map_row[x] + k] : borderValue;
+                        }
+                    }
+                }
+
+            }
+        }
+    }    
+    else if (borderMode == BORDER_TYPE_TRANSPARENT)
+    {
+        int32x4_t v_zero4 = vdupq_n_s32(0);
+        int32x4_t v_nega = vdupq_n_s32(-1);
+        int32x4_t max_width = vdupq_n_s32(inWidth - 1);
+        int32x4_t max_height = vdupq_n_s32(inHeight - 1);
+        int32x4_t v_cn = vdupq_n_s32(cn);
+        int32x4_t v_inWidthStride = vdupq_n_s32(inWidthStride);
+        int32x4_t v_round_delta = vdupq_n_s32(round_delta);
+        float32x4_t v_AB_SCALE = vdupq_n_f32(AB_SCALE);
+        for (size_t i = 0; i < outHeight; i += BLOCK_SIZE)
+        {
+            size_t blockHeight = std::min<size_t>(BLOCK_SIZE, inHeight - i);
+            for (size_t j = 0; j < outWidth; j += BLOCK_SIZE)
+            {
+                size_t blockWidth = std::min<size_t>(BLOCK_SIZE, inWidth - j);
+
+                // compute table
+                for (size_t y = 0; y < blockHeight; ++y)
+                {   
+                    int * map_row = getRowPtr(&map[0], blockWidth, y);
+                    size_t x = 0, dsty = y + i;
+                    float indeces[4] = { j + 0.0f, j + 1.0f, j + 2.0f, j + 3.0f };
+                    float32x4_t v_x = vld1q_f32(indeces), v_y = vdupq_n_f32(dsty);
+                    float32x4_t v_yx = vmlaq_f32(v_m2, v_m1, v_y), v_yy = vmlaq_f32(v_m5, v_m4, v_y);
+                    for ( ; x + 4 <= blockWidth; x += 4)
+                    {
+                        int dstx = x + j;
+                        int32x4_t X0 = vaddq_s32(vcvtq_s32_f32(vmulq_f32(v_yx, v_AB_SCALE)), v_round_delta);
+                        int32x4_t Y0 = vaddq_s32(vcvtq_s32_f32(vmulq_f32(v_yy, v_AB_SCALE)), v_round_delta);
+                        int32x4_t srcX = vshrq_n_s32(vaddq_s32(X0, vld1q_s32(adelta + dstx)), AB_BITS);
+                        int32x4_t srcY = vshrq_n_s32(vaddq_s32(Y0, vld1q_s32(bdelta + dstx)), AB_BITS);
+                        uint32x4_t flg0 = vcleq_u32(vreinterpretq_u32_s32(srcX), vreinterpretq_u32_s32(max_width));
+                        uint32x4_t flg1 = vcleq_u32(vreinterpretq_u32_s32(srcY), vreinterpretq_u32_s32(max_height));
+                        flg0 = vandq_u32(flg0, flg1);
+                        int32x4_t v_src_index = vmlaq_s32(vmulq_s32(srcY, v_inWidthStride), srcX, v_cn);
+                        v_src_index = vbslq_s32(flg0, v_src_index, v_nega);
+                        vst1q_s32(map_row + x, v_src_index);
+                    }
+                    
+                    for(; x < blockWidth; ++x){
+                        int dstx = x + j; 
+                        int X0 = rint((M[1] * dsty + M[2]) * AB_SCALE) + round_delta;
+                        int Y0 = rint((M[4] * dsty + M[5]) * AB_SCALE) + round_delta;
+                        int srcX = (X0 + adelta[dstx]) >> AB_BITS;
+                        int srcY = (Y0 + bdelta[dstx]) >> AB_BITS;
+                        if ((unsigned)(srcX - 0) <= (unsigned)(inWidth - 1 - 0) && (unsigned)(srcY - 0) <= (unsigned)(inHeight - 1 - 0))
+                            map_row[x] = srcY * inWidthStride + srcX * cn;
+                        else
+                            map_row[x] = -1;
+                    }
+                }
+                for (size_t y = 0; y < blockHeight; ++y)
+                {
+                    const int * map_row = getRowPtr(map, blockWidth, y);
+                    T * dst_row = getRowPtr(dst, outWidthStride, i + y) + j * cn;
+
+                    for (size_t x = 0; x < blockWidth; x++)
+                    {   
+                        if(map_row[x] < 0)
+                            continue;
+                        int tmp = x * cn;
+                        for(int k = 0; k < cn; ++k){
+                            dst_row[tmp + k] = src[map_row[x] + k];
+                        }
+                    }
+                }
+
+            }
+        }
+    }
 }
 
-static void initTab_linear_short(short *short_tab) {
+static void initTab_linear_short(float *short_tab) {
     float scale = 1.f / INTER_TAB_SIZE;
     for (int i = 0; i < INTER_TAB_SIZE; ++i) {
         float vy = i * scale;
         for (int j = 0; j < INTER_TAB_SIZE; ++j, short_tab += 4) {
             float vx = j * scale;
-            short_tab[0] = saturate_cast_short((1 - vy) * (1 - vx) * INTER_REMAP_COEF_SCALE);
-            short_tab[1] = saturate_cast_short((1 - vy) * vx * INTER_REMAP_COEF_SCALE);
-            short_tab[2] = saturate_cast_short(vy * (1 - vx) * INTER_REMAP_COEF_SCALE);
-            short_tab[3] = saturate_cast_short(vy * vx * INTER_REMAP_COEF_SCALE);
+            short_tab[0] = static_cast<float>(saturate_cast_short((1 - vy) * (1 - vx) * INTER_REMAP_COEF_SCALE));
+            short_tab[1] = static_cast<float>(saturate_cast_short((1 - vy) * vx * INTER_REMAP_COEF_SCALE));
+            short_tab[2] = static_cast<float>(saturate_cast_short(vy * (1 - vx) * INTER_REMAP_COEF_SCALE));
+            short_tab[3] = static_cast<float>(saturate_cast_short(vy * vx * INTER_REMAP_COEF_SCALE));
         }
     }
+    
 }
+
 
 template<typename T>
 void warpaffine_linear(int inHeight, int inWidth, int inWidthStride,
@@ -278,190 +484,6 @@ void warpaffine_linear(int inHeight, int inWidth, int inWidthStride,
 
 }
 
-void warpAffine_linear_uchar_common(uchar *dst, const uchar *src, 
-    int inHeight, int inWidth, int inWidthStride, 
-    int outHeight, int outWidth, int outWidthStride, 
-    const float *M, int cn, int borderMode, uchar borderValue = 0) {
-
-    short *short_tab = (short *) malloc(INTER_TAB_SIZE * INTER_TAB_SIZE * 8 * sizeof(short));
-    initTab_linear_short(short_tab);
-
-    int round_delta = AB_SCALE / INTER_TAB_SIZE / 2;
-
-    int *adelta = (int *) malloc(outWidth * sizeof(int));
-    int *bdelta = (int *) malloc(outWidth * sizeof(int));
-    for (int i = 0; i < outWidth; ++i) {
-        adelta[i] = rint(M[0] * i * AB_SCALE);
-        bdelta[i] = rint(M[3] * i * AB_SCALE);
-    }
-
-    const int BLOCK_SZ = 64;
-    short XY_INT[BLOCK_SZ * BLOCK_SZ * 2], XY_DEC[BLOCK_SZ * BLOCK_SZ];
-    int bh0 = std::min<int>(BLOCK_SZ / 2, outHeight);
-    int bw0 = std::min<int>(BLOCK_SZ * BLOCK_SZ / bh0, outWidth);
-    bh0 = std::min<int>(BLOCK_SZ * BLOCK_SZ / bw0, outHeight);
-
-    for (int y = 0; y < outHeight; y += bh0) {
-        int bh = std::min<int>(bh0, outHeight - y);
-        for (int x = 0; x < outWidth; x += bw0) {
-            int bw = std::min<int>(bw0, outWidth - x);
-            for (int y1 = 0; y1 < bh; ++y1) {
-                short *xy_int_p = XY_INT + y1 * bw * 2;
-                short *xy_dec_p = XY_DEC + y1 * bw;
-                int x_int = (int) ((M[1] * (y + y1) + M[2]) * AB_SCALE) + round_delta;
-                int y_int = (int) ((M[4] * (y + y1) + M[5]) * AB_SCALE) + round_delta;
-
-                int32x4_t dec_mask = vdupq_n_s32(INTER_TAB_SIZE - 1);
-                int32x4_t m_X_int = vdupq_n_s32(x_int);
-                int32x4_t m_Y_int = vdupq_n_s32(y_int);
-                int x1 = 0;
-                for (; x1 <= bw - 8; x1 += 8) {
-                    int32x4_t tx0, tx1, ty0, ty1;
-                    tx0 = vaddq_s32(m_X_int, vld1q_s32(adelta + x + x1));
-                    tx1 = vaddq_s32(m_X_int, vld1q_s32(adelta + x + x1 + 4));
-                    ty0 = vaddq_s32(m_Y_int, vld1q_s32(bdelta + x + x1));
-                    ty1 = vaddq_s32(m_Y_int, vld1q_s32(bdelta + x + x1 + 4));
-
-                    tx0 = vshrq_n_s32(tx0, AB_BITS - INTER_BITS);
-                    tx1 = vshrq_n_s32(tx1, AB_BITS - INTER_BITS);
-                    ty0 = vshrq_n_s32(ty0, AB_BITS - INTER_BITS);
-                    ty1 = vshrq_n_s32(ty1, AB_BITS - INTER_BITS);
-
-                    int16x8_t fx, fy;
-                    fx = vcombine_s16(
-                        vqmovn_s32(vandq_s32(tx0, dec_mask)), 
-                        vqmovn_s32(vandq_s32(tx1, dec_mask))
-                        );
-                    fy = vcombine_s16(
-                        vqmovn_s32(vandq_s32(ty0, dec_mask)), 
-                        vqmovn_s32(vandq_s32(ty1, dec_mask))
-                        );
-                    int16x8_t final_f = vaddq_s16(fx, vshlq_n_s16(fy, INTER_BITS));
-
-                    tx0 = vshrq_n_s32(tx0, INTER_BITS);
-                    tx1 = vshrq_n_s32(tx1, INTER_BITS);
-                    ty0 = vshrq_n_s32(ty0, INTER_BITS);
-                    ty1 = vshrq_n_s32(ty1, INTER_BITS);
-                    int16x4x2_t zip0;
-                    zip0.val[0] = vqmovn_s32(tx0);
-                    zip0.val[1] = vqmovn_s32(ty0);
-                    int16x4x2_t zip1;
-                    zip1.val[0] = vqmovn_s32(tx1);
-                    zip1.val[1] = vqmovn_s32(ty1);
-
-                    vst2_s16(xy_int_p + x1 * 2, zip0);
-                    vst2_s16(xy_int_p + x1 * 2 + 8, zip1);
-                    vst1q_s16(xy_dec_p + x1, final_f);
-                }
-                for (; x1 < bw; ++x1) {
-                    int x_value = (x_int + adelta[x + x1]) >> (AB_BITS - INTER_BITS);
-                    int y_value = (y_int + bdelta[x + x1]) >> (AB_BITS - INTER_BITS);
-                    xy_int_p[x1 * 2] = saturate_cast_short(x_value >> INTER_BITS);
-                    xy_int_p[x1 * 2 + 1] = saturate_cast_short(y_value >> INTER_BITS);
-                    xy_dec_p[x1] = (short)((y_value & (INTER_TAB_SIZE - 1)) * INTER_TAB_SIZE + 
-                        (x_value & (INTER_TAB_SIZE - 1)));
-                }
-            }
-            for (int y1 = 0; y1 < bh; ++y1) {
-                int dstY = y1 + y;
-                for (int x1 = 0; x1 < bw; ++x1) {
-                    int srcX = XY_INT[2 * (y1 * bw + x1)];
-                    int srcY = XY_INT[2 * (y1 * bw + x1) + 1];
-                    int dstX = x1 + x;
-                    int dstIndex = dstY * outWidthStride + dstX * cn;
-
-                    bool flag[4];
-
-                    if(borderMode == BORDER_TYPE_CONSTANT)
-                    {
-                        flag[0] = (srcX >= 0 && srcX < inWidth && srcY >= 0 && srcY < inHeight);
-                        flag[1] = (srcX+1 >= 0 && srcX+1 < inWidth && srcY >= 0 && srcY < inHeight);
-                        flag[2] = (srcX >= 0 && srcX < inWidth && srcY+1 >= 0 && srcY+1 < inHeight);
-                        flag[3] = (srcX+1 >= 0 && srcX+1 < inWidth && srcY+1 >= 0 && srcY+1 < inHeight);
-                        int srcIndex = srcY * inWidthStride + srcX * cn;
-                        const short *p_short_tab = short_tab + XY_DEC[y1 * bw + x1] * 4;
-                        float src_value[4];
-                        for (int k = 0; k < cn; ++k) {
-                            src_value[0] = flag[0] ? src[srcIndex + k] : borderValue;
-                            src_value[1] = flag[1] ? src[srcIndex + cn + k] : borderValue;
-                            src_value[2] = flag[2] ? src[srcIndex + inWidthStride + k] : borderValue;
-                            src_value[3] = flag[3] ? src[srcIndex + inWidthStride + cn + k] : borderValue;
-
-                            float sum = 0;
-                            //linear interpolation
-                            sum += src_value[0] * p_short_tab[0];
-                            sum += src_value[1] * p_short_tab[1];
-                            sum += src_value[2] * p_short_tab[2];
-                            sum += src_value[3] * p_short_tab[3];
-                            dst[dstIndex + k] = (int(sum + (1 << (INTER_REMAP_COEF_BITS - 1))) >> INTER_REMAP_COEF_BITS);
-                        }
-                    }
-                    else if(borderMode == BORDER_TYPE_TRANSPARENT)
-                    {
-                        flag[0] = (srcX >= 0 && srcX < inWidth && srcY >= 0 && srcY < inHeight);
-                        flag[1] = (srcX+1 >= 0 && srcX+1 < inWidth && srcY >= 0 && srcY < inHeight);
-                        flag[2] = (srcX >= 0 && srcX < inWidth && srcY+1 >= 0 && srcY+1 < inHeight);
-                        flag[3] = (srcX+1 >= 0 && srcX+1 < inWidth && srcY+1 >= 0 && srcY+1 < inHeight);
-                        if(flag[0] && flag[1] && flag[2] && flag[3])
-                        {
-                            int srcIndex = srcY * inWidthStride + srcX * cn;
-                            const short *p_short_tab = short_tab + XY_DEC[y1 * bw + x1] * 4;
-                            float src_value[4];
-                            for (int k = 0; k < cn; ++k) {
-                                src_value[0] = src[srcIndex + k];
-                                src_value[1] = src[srcIndex + cn + k];
-                                src_value[2] = src[srcIndex + inWidthStride + k];
-                                src_value[3] = src[srcIndex + inWidthStride + cn + k];
-
-                                float sum = 0;
-                                //linear interpolation
-                                sum += src_value[0] * p_short_tab[0];
-                                sum += src_value[1] * p_short_tab[1];
-                                sum += src_value[2] * p_short_tab[2];
-                                sum += src_value[3] * p_short_tab[3];
-                                dst[dstIndex + k] = (int(sum + (1 << (INTER_REMAP_COEF_BITS - 1))) >> INTER_REMAP_COEF_BITS);
-                            }
-                        }
-                        else
-                        {
-                            continue;
-                        }
-                        
-                    }
-                    else if(borderMode == BORDER_TYPE_REPLICATE)
-                    {
-                        int sx0 = clip(srcX, 0, inWidth - 1);
-                        int sy0 = clip(srcY, 0, inHeight - 1);
-                        int sx1 = clip((srcX + 1), 0, inWidth - 1);
-                        int sy1 = clip((srcY + 1), 0, inHeight - 1);
-
-                        const uchar *t0 = src + sy0 * inWidthStride + sx0 * cn;
-                        const uchar *t1 = src + sy0 * inWidthStride + sx1 * cn;
-                        const uchar *t2 = src + sy1 * inWidthStride + sx0 * cn;
-                        const uchar *t3 = src + sy1 * inWidthStride + sx1 * cn;
-
-                        const short *p_short_tab = short_tab + XY_DEC[y1 * bw + x1] * 4;
-                        for (int k = 0; k < cn; ++k) {
-                            float sum = 0;
-                            //linear interpolation
-                            sum += t0[k] * p_short_tab[0];
-                            sum += t1[k] * p_short_tab[1];
-                            sum += t2[k] * p_short_tab[2];
-                            sum += t3[k] * p_short_tab[3];
-                            dst[dstIndex + k] = (int(sum + (1 << (INTER_REMAP_COEF_BITS - 1))) >> INTER_REMAP_COEF_BITS);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    free(short_tab);
-    free(adelta);
-    free(bdelta);
-}
-
-
 void warpAffine_linear_uchar(uchar *dst, const uchar *src, 
     int inHeight, int inWidth, int inWidthStride, 
     int outHeight, int outWidth, int outWidthStride, 
@@ -477,13 +499,13 @@ void warpAffine_linear_uchar(uchar *dst, const uchar *src,
     int *ptrb = bdelta;
 
     for (int x = 0; x < outWidth; ++x) {
-        *ptra++ = saturate_cast<int>(M[0] * x * 1024);
-        *ptra++ = saturate_cast<int>(M[3] * x * 1024);
+        *ptra++ = static_cast<int>(M[0] * x * 1024);
+        *ptra++ = static_cast<int>(M[3] * x * 1024);
     }
 
     for (int y = 0; y < outHeight; ++y) {
-        *ptrb++ = saturate_cast<int>((M[1] * y + M[2]) * 1024);
-        *ptrb++ = saturate_cast<int>((M[4] * y + M[5]) * 1024);
+        *ptrb++ = static_cast<int>((M[1] * y + M[2]) * 1024);
+        *ptrb++ = static_cast<int>((M[4] * y + M[5]) * 1024);
     }
 
     int DELTA = 1 << 14;
@@ -512,7 +534,7 @@ void warpAffine_linear_uchar(uchar *dst, const uchar *src,
                 short *wtab = BilinearTab_i[new_xy_float][0];
                 int loc_base = new_y_loc * inWidthStride + new_x_loc;
 
-                if ((new_x_loc >= 0) && (new_x_loc < inWidth - 1 ) && (new_y_loc >= 0) && (new_y_loc < inHeight - 1)) {
+                if (((new_x_loc >= 0) && (new_x_loc < inWidth - 1 ) && (new_y_loc >= 0) && (new_y_loc < inHeight - 1))) {
                     unsigned short *ptr = (unsigned short*)(src + loc_base);
                     unsigned short *ptr2 = (unsigned short*)(src2 + loc_base);
                     buf_point[2 * x] = ptr[0];
@@ -564,7 +586,7 @@ void warpAffine_linear_uchar(uchar *dst, const uchar *src,
                             val_xy0 += wtab[3] * borderValue;
                         }
 
-                        dst[final_loc] = saturate_cast<uchar>((val_xy0 + DELTA) >> 15);
+                        dst[final_loc] = static_cast<uchar>((val_xy0 + DELTA) >> 15);
                     } else if(borderMode == BORDER_TYPE_TRANSPARENT) {
                         continue;
                     } else if(borderMode == BORDER_TYPE_REPLICATE) {
@@ -579,7 +601,7 @@ void warpAffine_linear_uchar(uchar *dst, const uchar *src,
                             src[sy1 * inWidthStride + sx0] * wtab[2] +
                             src[sy1 * inWidthStride + sx1] * wtab[3];
 
-                        dst[final_loc] = saturate_cast<uchar>((val_xy0 + DELTA) >> 15);
+                        dst[final_loc] = static_cast<uchar>((val_xy0 + DELTA) >> 15);
                     }
                 }
             }
@@ -592,7 +614,52 @@ void warpAffine_linear_uchar(uchar *dst, const uchar *src,
             short *BilinearTab_ptr = BilinearTab_i[0][0];
             int simd_loop = x_count >> 3;
 
-#if 1         
+            // for(; x <= end_x - 8 + 1; x += 8) {
+            //     int final_loc = final_loc_base + x;
+            //     uint8x16_t point = vld1q_u8(ptr);
+            //     uint16x8_t point0 = vmovl_u8(vget_low_u8(point));
+            //     uint16x8_t point1 = vmovl_high_u8(point);
+            //     int32x4_t pointx0 = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(point0)));
+            //     int32x4_t pointx1 = vreinterpretq_s32_u32(vmovl_high_u16(point0));
+            //     int32x4_t pointx2 = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(point1)));
+            //     int32x4_t pointx3 = vreinterpretq_s32_u32(vmovl_high_u16(point1));
+            //     int32x4x4_t wtab0 = {
+            //         vmovl_s16(vld1_s16(BilinearTab_i[tab_loc[x]][0])),
+            //         vmovl_s16(vld1_s16(BilinearTab_i[tab_loc[x+1]][0])),
+            //         vmovl_s16(vld1_s16(BilinearTab_i[tab_loc[x+2]][0])),
+            //         vmovl_s16(vld1_s16(BilinearTab_i[tab_loc[x+3]][0]))
+            //     };
+            //     int32x4_t val_xy0 = {
+            //         vaddvq_s32(vmulq_s32(wtab0.val[0], pointx0)),
+            //         vaddvq_s32(vmulq_s32(wtab0.val[1], pointx1)),
+            //         vaddvq_s32(vmulq_s32(wtab0.val[2], pointx2)),
+            //         vaddvq_s32(vmulq_s32(wtab0.val[3], pointx3))
+            //     };
+            //     point = vld1q_u8(ptr + 16);
+            //     point0 = vmovl_u8(vget_low_u8(point));
+            //     point1 = vmovl_high_u8(point);
+            //     pointx0 = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(point0)));
+            //     pointx1 = vreinterpretq_s32_u32(vmovl_high_u16(point0));
+            //     pointx2 = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(point1)));
+            //     pointx3 = vreinterpretq_s32_u32(vmovl_high_u16(point1));
+            //     int32x4x4_t wtab1 = {
+            //         vmovl_s16(vld1_s16(BilinearTab_i[tab_loc[x+4]][0])),
+            //         vmovl_s16(vld1_s16(BilinearTab_i[tab_loc[x+5]][0])),
+            //         vmovl_s16(vld1_s16(BilinearTab_i[tab_loc[x+6]][0])),
+            //         vmovl_s16(vld1_s16(BilinearTab_i[tab_loc[x+7]][0]))
+            //     };
+            //     int32x4_t val_xy1 = {
+            //         vaddvq_s32(vmulq_s32(wtab1.val[0], pointx0)),
+            //         vaddvq_s32(vmulq_s32(wtab1.val[1], pointx1)),
+            //         vaddvq_s32(vmulq_s32(wtab1.val[2], pointx2)),
+            //         vaddvq_s32(vmulq_s32(wtab1.val[3], pointx3))
+            //     };
+            //     int32x4_t res_low = vshrq_n_s32(vaddq_s32(val_xy0, DELTA_vec), 15);
+            //     int32x4_t res_high = vshrq_n_s32(vaddq_s32(val_xy1, DELTA_vec), 15);
+            //     int16x8_t res = vcombine_s16(vmovn_s32(res_low), vmovn_s32(res_high));
+            //     vst1_u8(dst + final_loc, vreinterpret_u8_s8(vmovn_s16(res)));
+            //     ptr += 32;
+            // }
             if (simd_loop > 0) {
                 asm volatile (
                     "subs x12, %7, #1\n\t"
@@ -683,105 +750,9 @@ void warpAffine_linear_uchar(uchar *dst, const uchar *src,
                          :"cc","memory","x13","x14","x9","x10","x11","x12","v0","v1","v2","v3","v4","v5","v6","v7","v8","v9","v10","v11");
                 x = x + (simd_loop << 3);
             }
-#else
-            for (; x <= end_x - 8 + 1; x += 8) {
-                asm volatile(
-                    "#a32 mark1\n\t"
-                    "#load from tab_loc\n\t"
-                    "add r1, %5, %6, lsl #1\n\t"
-                    "vld1.16 {d8}, [r1]!\n\t"
-                    "#load from ptr\n\t"
-                    "vld1.32 {d0[0]}, [%0]!\n\t"
-                    "#load from BilinearTab\n\t"
-                    "vmov.s16 r2, d8[0]\n\t"
-                    "vld1.32 {d2[0]}, [%0]!\n\t"
-                    "vmov.s16 r3, d8[1]\n\t"
-                    "vld1.32 {d4[0]}, [%0]!\n\t"
-                    "vmov.s16 r4, d8[2]\n\t"
-                    "vld1.32 {d6[0]}, [%0]!\n\t"
-                    // "vmov.s16 r11, d8[3]\n\t"
-                    "vld1.16 {d12}, [r1]\n\t"
-                    "vmov.s16 r1, d8[3]\n"
-                    "add r2, %4, r2, lsl #3\n\t"
-                    "add r3, %4, r3, lsl #3\n\t"
-                    "add r4, %4, r4, lsl #3\n\t"
-                    // "add r11, %4, r11, lsl #3\n\t"
-                    "add r1, %4, r1, lsl #3\n\t"
-                    "vld1.16 {d8}, [r2]\n\t"
-                    "vld1.16 {d9}, [r3]\n\t"
-                    "vld1.16 {d10}, [r4]\n\t"
-                    "vld1.16 {d11}, [r1]\n\t"
-                    "vmov.s16 r2, d12[0]\n\t"
-                    "vmov.s16 r3, d12[1]\n\t"
-                    "vmov.s16 r4, d12[2]\n\t"
-                    "vmov.s16 r1, d12[3]\n\t"
 
-                    "vld1.32 {d12[0]}, [%0]!\n\t"
-                    "add r2, %4, r2, lsl #3\n\t"
-                    "add r3, %4, r3, lsl #3\n\t"
-                    "add r4, %4, r4, lsl #3\n\t"
-                    "add r1, %4, r1, lsl #3\n\t"
-                    "vld1.32 {d14[0]}, [%0]!\n\t"
+ 
 
-                    "#calculate p0*w0\n\t"
-                    "vmovl.u8 q0, d0\n\t"
-                    "vld1.32 {d16[0]}, [%0]!\n\t"
-                    "vmovl.u8 q1, d2\n\t"
-                    "vmovl.u8 q2, d4\n\t"
-                    "vmovl.u8 q3, d6\n\t"
-                    "vld1.32 {d18[0]}, [%0]!\n\t"
-
-                    "vld1.16 {d20}, [r2]\n\t"
-                    "vld1.16 {d21}, [r3]\n\t"
-                    "vld1.16 {d22}, [r4]\n\t"
-                    "vld1.16 {d23}, [r1]\n\t"
-
-                    "vmull.s16 q0, d0, d8\n\t"
-                    "vmull.s16 q1, d2, d9\n\t"
-                    "vmull.s16 q2, d4, d10\n\t"
-                    "vmull.s16 q3, d6, d11\n\t"
-
-                    "vpadd.i32 d0, d0, d1\n\t"
-                    "vpadd.i32 d1, d2, d3\n\t"
-                    "vpadd.i32 d2, d4, d5\n\t"
-                    "vpadd.i32 d3, d6, d7\n\t"
-
-                    "vmovl.u8 q6, d12\n\t"
-                    "vmovl.u8 q7, d14\n\t"
-                    "vmovl.u8 q8, d16\n\t"
-                    "vmovl.u8 q9, d18\n\t"
-
-                    "vpadd.i32 d0, d0, d1\n\t"
-                    "vpadd.i32 d1, d2, d3\n\t"
-
-                    "vmull.s16 q6, d12, d20\n\t"
-                    "vmull.s16 q7, d14, d21\n\t"
-                    "vmull.s16 q8, d16, d22\n\t"
-                    "vmull.s16 q9, d18, d23\n\t"
-
-                    "vadd.i32 q0, q0, %q7\n\t"
-                    "vshrn.i32 d0, q0, #15\n\t"
-
-                    "vpadd.i32 d12, d12, d13\n\t"
-                    "vpadd.i32 d13, d14, d15\n\t"
-                    "vpadd.i32 d14, d16, d17\n\t"
-                    "vpadd.i32 d15, d18, d19\n\t"
-
-                    "vpadd.i32 d12, d12, d13\n\t"
-                    "vpadd.i32 d13, d14, d15\n\t"
-
-                    "vadd.i32 q6, q6, %q7\n\t"
-                    "vshrn.i32 d1, q6, #15\n\t"
-
-                    "vmovn.i16 d0, q0\n\t"
-                    "vst1.8 {d0}, [%1]!\n\t"
-
-                    :"=r"(ptr),"=r"(dst_loc)
-                    :"0"(ptr),"1"(dst_loc),"r"(BilinearTab_ptr),"r"(tab_loc),"r"(x),"w"(DELTA_vec)
-                    :"cc","memory","r1","r2","r3","r4","q0","q1","q2","q3","q4","q5","q6","q7","q8","q9","q10","q11"
-                );
-            }
-#endif //a64
             for (; x <= end_x; ++x) {
                 int final_loc = final_loc_base + x;
                 short *wtab = BilinearTab_i[tab_loc[x]][0];
@@ -792,7 +763,7 @@ void warpAffine_linear_uchar(uchar *dst, const uchar *src,
                 ptr += 4;
 
                 int val_xy0 = wtab[0] * point0 + wtab[1] * point1 + wtab[2] * point2 + wtab[3] * point3;
-                dst[final_loc] = saturate_cast<uchar>((val_xy0 + DELTA) >> 15);
+                dst[final_loc] = static_cast<uchar>((val_xy0 + DELTA) >> 15);
             }
         }
 
@@ -848,7 +819,7 @@ void warpAffine_linear_uchar(uchar *dst, const uchar *src,
                 int new_xy_float = xy_float_buf[x];
                 short *wtab = BilinearTab_i[new_xy_float][0];
 
-                if ((new_x_loc >= 0) && (new_x_loc < inWidth - 2) && (new_y_loc >= 0) && (new_y_loc < inHeight - 1)) {
+                if ((new_x_loc >= 0) && (new_x_loc < inWidth - 1) && (new_y_loc >= 0) && (new_y_loc < inHeight - 1)) {
                     buf_loc[x] = new_y_loc * inWidthStride + new_x_loc * 3;
                     tab_loc[x] = new_xy_float;
                     x_count++;
@@ -918,11 +889,11 @@ void warpAffine_linear_uchar(uchar *dst, const uchar *src,
                             val_xy2 += wtab[3] * borderValue;
                         }
 
-                        dst[final_loc + 0] = saturate_cast<uchar>((val_xy0 + DELTA) >> 15);
-                        dst[final_loc + 1] = saturate_cast<uchar>((val_xy1 + DELTA) >> 15);
-                        dst[final_loc + 2] = saturate_cast<uchar>((val_xy2 + DELTA) >> 15);
+                        dst[final_loc + 0] = static_cast<uchar>((val_xy0 + DELTA) >> 15);
+                        dst[final_loc + 1] = static_cast<uchar>((val_xy1 + DELTA) >> 15);
+                        dst[final_loc + 2] = static_cast<uchar>((val_xy2 + DELTA) >> 15);
                     } else if(borderMode == BORDER_TYPE_TRANSPARENT) {
-                       continue;
+                        continue;
                     } else if(borderMode == BORDER_TYPE_REPLICATE) {
                         int sx0 = clip(new_x_loc, 0, inWidth - 1);
                         int sy0 = clip(new_y_loc, 0, inHeight - 1);
@@ -948,9 +919,9 @@ void warpAffine_linear_uchar(uchar *dst, const uchar *src,
                             src[sy1 * inWidthStride + sx1 * 3 + 2] * wtab[3];
 
                         int final_loc = final_loc_base + x * 3;
-                        dst[final_loc + 0] = saturate_cast<uchar>((val_xy0 + DELTA) >> 15);
-                        dst[final_loc + 1] = saturate_cast<uchar>((val_xy1 + DELTA) >> 15);
-                        dst[final_loc + 2] = saturate_cast<uchar>((val_xy2 + DELTA) >> 15);
+                        dst[final_loc + 0] = static_cast<uchar>((val_xy0 + DELTA) >> 15);
+                        dst[final_loc + 1] = static_cast<uchar>((val_xy1 + DELTA) >> 15);
+                        dst[final_loc + 2] = static_cast<uchar>((val_xy2 + DELTA) >> 15);
                     }
                 }
             }
@@ -961,7 +932,6 @@ void warpAffine_linear_uchar(uchar *dst, const uchar *src,
             uchar* dst_loc = dst + final_loc_base + x * 3;
 
             short * BilinearTab_ptr = BilinearTab_i[0][0];
-#if 1          
             int simd_loop = x_count >> 2;
             int cmp_flag = end_x - 4 + 1;
             if (simd_loop > 0) {
@@ -1080,148 +1050,11 @@ void warpAffine_linear_uchar(uchar *dst, const uchar *src,
                 );
                 x = x + (simd_loop << 2);
             }
-#else
-            int *buf_loc_base = &buf_loc[x];
-            short *tab_loc_base = &tab_loc[x];
-            for (; x <= end_x - 4 + 1; x += 4) {
-                asm volatile(
-                    "#load from tab_loc and buf_loc\n\t"
-                    // "add r7, %1, %7, lsl #1\n\t"
-                    // "add r8, %2, %7, lsl #2\n\t"
-                    "vld1.16 {d0}, [%1]!\n\t"
-                    "vld1.32 {q1}, [%2]!\n\t"
-
-                    "vmov.s16 r1, d0[0]\n\t"
-                    "vmov.s16 r4, d0[1]\n\t"
-                    "vmov.32 r2, d2[0]\n\t"
-                    // "vmov.32 r11, d2[1]\n\t"
-                    "add r1, %6, r1, lsl #3\n\t"
-                    "add r4, %6, r4, lsl #3\n\t"
-                    "add r3, %8, r2\n\t"
-                    // "add r12, %5, r11\n\t"
-                    "add r2, %7, r2\n\t"
-                    // "add r11, %4, r11\n\t"
-                    "#wtab0 and wtab1\n\t"
-                    "vld1.16 {d4}, [r1]\n\t"
-                    "vmov.32 r1, d2[1]\n\t"//new
-                    "vld1.16 {d1}, [r4]\n\t"
-                    "add r4, %8, r1\n\t"//new
-                    "add r1, %7, r1\n\t"//new
-                    "#point_vec00 and point_vec01\n\t"
-                    "vld1.8 {d6}, [r2]\n\t"
-                    "vld1.8 {d8}, [r3]\n\t"
-                    "#point_vec10 and point_vec10\n\t"
-                    "vld1.8 {d12}, [r1]\n\t"//new
-                    "vld1.8 {d14}, [r4]\n\t"//new
-
-                    "vmov.s16 r1, d0[2]\n\t"
-                    "vmov.s16 r4, d0[3]\n\t"
-                    "vmov.32 r2, d3[0]\n\t"
-                    // "vmov.32 r11, d3[1]\n\t"
-
-                    "#calculate vec00 and vec01\n\t"
-                    "vmovl.u8 q3, d6\n\t"
-                    "vmovl.u8 q4, d8\n\t"
-                    "#calculate vec10 and vec11\n\t"
-                    "vmovl.u8 q6, d12\n\t"
-                    "vmovl.u8 q7, d14\n\t"
-
-                    "add r1, %6, r1, lsl #3\n\t"
-                    "add r4, %6, r4, lsl #3\n\t"
-                    "add r3, %8, r2\n\t"
-                    // "add r12, %5, r11\n\t"
-                    "add r2, %7, r2\n\t"
-                    // "add r11, %4, r11\n\t"
-
-                    "vext.8 d7, d6, d7, #6\n\t"
-                    "vext.8 d9, d8, d9, #6\n\t"
-                    "vext.8 d13, d12, d13, #6\n\t"
-                    "vext.8 d15, d14, d15, #6\n\t"
-
-                    "vmull.s16 q10, d6, d4[0]\n\t"
-                    "vmull.s16 q11, d8, d4[2]\n\t"
-                    "vmlal.s16 q10, d7, d4[1]\n\t"
-                    "vmlal.s16 q11, d9, d4[3]\n\t"
-
-                    "#wtab2\n\t"
-                    "vld1.16 {d4}, [r1]\n\t"
-                    "vmov.32 r1, d3[1]\n\t"//new
-                    "#point_vec20 and point_vec21\n\t"
-                    "vld1.8 {d6}, [r2]\n\t"
-                    "vld1.8 {d8}, [r3]\n\t"
-
-                    "vmull.s16 q12, d12, d1[0]\n\t"
-                    "vmull.s16 q13, d14, d1[2]\n\t"
-                    "vmlal.s16 q12, d13, d1[1]\n\t"
-                    "vmlal.s16 q13, d15, d1[3]\n\t"
-                    "vadd.i32 q10, q11, q10\n\t"
-                    "vadd.i32 q12, q12, q13\n\t"
-
-                    "#wtab3\n\t"
-                    "vld1.16 {d1}, [r4]\n\t"
-                    "add r4, %8, r1\n\t"//new
-                    "add r1, %7, r1\n\t"//new
-                    "#point_vec30 and point_vec31\n\t"
-                    "vld1.8 {d12}, [r1]\n\t"//new
-                    "vld1.8 {d14}, [r4]\n\t"//new
-
-                    "vadd.i32 q10, q10, %q9\n\t"
-                    "vadd.i32 q12, q12, %q9\n\t"
-                    "vshrn.i32 d20, q10, #15\n\t"
-                    "vshrn.i32 d21, q12, #15\n\t"
-
-                    "#calculate vec20 and vec21\n\t"
-                    "vmovl.u8 q3, d6\n\t"
-                    "vmovl.u8 q4, d8\n\t"
-
-                    "#store results\n\t"
-                    "vmovn.i16 d20, q10\n\t"
-                    "vtbl.8 d20, {d20}, %10\n\t"
-
-                    "#calculate vec30 and vec31\n\t"
-                    "vmovl.u8 q6, d12\n\t"
-                    "vmovl.u8 q7, d14\n\t"
-
-                    "vext.8 d7, d6, d7, #6\n\t"
-                    "vext.8 d9, d8, d9, #6\n\t"
-                    "vext.8 d13, d12, d13, #6\n\t"
-                    "vext.8 d15, d14, d15, #6\n\t"
-
-                    "vst1.32 {d20[0]}, [%0]!\n\t"
-                    "vst1.16 {d20[2]}, [%0]!\n\t"
-
-                    "vmull.s16 q10, d6, d4[0]\n\t"
-                    "vmull.s16 q11, d8, d4[2]\n\t"
-                    "vmlal.s16 q10, d7, d4[1]\n\t"
-                    "vmlal.s16 q11, d9, d4[3]\n\t"
-                    "vmull.s16 q12, d12, d1[0]\n\t"
-                    "vmull.s16 q13, d14, d1[2]\n\t"
-                    "vmlal.s16 q12, d13, d1[1]\n\t"
-                    "vmlal.s16 q13, d15, d1[3]\n\t"
-
-                    "vadd.i32 q10, q11, q10\n\t"
-                    "vadd.i32 q12, q12, q13\n\t"
-                    "vadd.i32 q10, q10, %q9\n\t"
-                    "vadd.i32 q12, q12, %q9\n\t"
-                    "vshrn.i32 d20, q10, #15\n\t"
-                    "vshrn.i32 d21, q12, #15\n\t"
-                    "vmovn.i16 d20, q10\n\t"
-                    "vtbl.8 d20, {d20}, %10\n\t"
-
-                    "vst1.32 {d20[0]}, [%0]!\n\t"
-                    "vst1.16 {d20[2]}, [%0]!\n\t"
-                    :"=r"(dst_loc),"=r"(tab_loc_base),"=r"(buf_loc_base)
-                    :"0"(dst_loc),"1"(tab_loc_base),"2"(buf_loc_base),"r"(BilinearTab_ptr),"r"(src),"r"(src2),"w"(DELTA_vec),"w"(tb)
-                    :"cc","memory","r1","r2","r3","r4","q0","q1","q2","q3","q4","q5","q6","q7","q10","q11","q12","q13"
-                );
-            }
-#endif
 
             for (; x <= end_x; x++) {
                 int final_loc = final_loc_base + x * 3;
                 int loc_buffer = buf_loc[x];
                 short *wtab = BilinearTab_i[tab_loc[x]][0];
-    
                 int point00 = src[loc_buffer];
                 int point01 = src[loc_buffer + 1];
                 int point02 = src[loc_buffer + 2];
@@ -1238,9 +1071,9 @@ void warpAffine_linear_uchar(uchar *dst, const uchar *src,
                 int val_xy0 = wtab[0] * point00 + wtab[1] * point03 + wtab[2] * point10 + wtab[3] * point13;
                 int val_xy1 = wtab[0] * point01 + wtab[1] * point04 + wtab[2] * point11 + wtab[3] * point14;
                 int val_xy2 = wtab[0] * point02 + wtab[1] * point05 + wtab[2] * point12 + wtab[3] * point15;
-                dst[final_loc + 0] = saturate_cast<uchar>((val_xy0 + DELTA) >> 15);
-                dst[final_loc + 1] = saturate_cast<uchar>((val_xy1 + DELTA) >> 15);
-                dst[final_loc + 2] = saturate_cast<uchar>((val_xy2 + DELTA) >> 15);
+                dst[final_loc + 0] = static_cast<uchar>((val_xy0 + DELTA) >> 15);
+                dst[final_loc + 1] = static_cast<uchar>((val_xy1 + DELTA) >> 15);
+                dst[final_loc + 2] = static_cast<uchar>((val_xy2 + DELTA) >> 15);
             }
         }
 
@@ -1376,10 +1209,10 @@ void warpAffine_linear_uchar(uchar *dst, const uchar *src,
                             val_xy3 += wtab[3] * borderValue;
                         }
 
-                        dst[final_loc + 0] = saturate_cast<uchar>((val_xy0 + DELTA) >> 15);
-                        dst[final_loc + 1] = saturate_cast<uchar>((val_xy1 + DELTA) >> 15);
-                        dst[final_loc + 2] = saturate_cast<uchar>((val_xy2 + DELTA) >> 15);
-                        dst[final_loc + 3] = saturate_cast<uchar>((val_xy3 + DELTA) >> 15);
+                        dst[final_loc + 0] = static_cast<uchar>((val_xy0 + DELTA) >> 15);
+                        dst[final_loc + 1] = static_cast<uchar>((val_xy1 + DELTA) >> 15);
+                        dst[final_loc + 2] = static_cast<uchar>((val_xy2 + DELTA) >> 15);
+                        dst[final_loc + 3] = static_cast<uchar>((val_xy3 + DELTA) >> 15);
                     } else if(borderMode == BORDER_TYPE_TRANSPARENT) {
                         continue;
                     } else if(borderMode == BORDER_TYPE_REPLICATE) {
@@ -1413,10 +1246,10 @@ void warpAffine_linear_uchar(uchar *dst, const uchar *src,
                             src[sy1 * inWidthStride + sx1 * 4 + 3] * wtab[3];
 
                         int final_loc = final_loc_base + x * 4;
-                        dst[final_loc + 0] = saturate_cast<uchar>((val_xy0 + DELTA) >> 15);
-                        dst[final_loc + 1] = saturate_cast<uchar>((val_xy1 + DELTA) >> 15);
-                        dst[final_loc + 2] = saturate_cast<uchar>((val_xy2 + DELTA) >> 15);
-                        dst[final_loc + 3] = saturate_cast<uchar>((val_xy3 + DELTA) >> 15);
+                        dst[final_loc + 0] = static_cast<uchar>((val_xy0 + DELTA) >> 15);
+                        dst[final_loc + 1] = static_cast<uchar>((val_xy1 + DELTA) >> 15);
+                        dst[final_loc + 2] = static_cast<uchar>((val_xy2 + DELTA) >> 15);
+                        dst[final_loc + 3] = static_cast<uchar>((val_xy3 + DELTA) >> 15);
                     }
                 }
             }
@@ -1425,8 +1258,6 @@ void warpAffine_linear_uchar(uchar *dst, const uchar *src,
             int32x4_t DELTA_vec = vdupq_n_s32(DELTA);
             uchar* dst_loc = dst + final_loc_base + x * 4;
             short * BilinearTab_ptr = BilinearTab_i[0][0];
-
-#if 1
             int simd_loop = x_count >> 2;
             if (simd_loop > 0) {
                 asm volatile(
@@ -1546,120 +1377,6 @@ void warpAffine_linear_uchar(uchar *dst, const uchar *src,
                 );
                 x = x + (simd_loop << 2);
             }
-#else
-            int *buf_loc_base = &buf_loc[x];
-            short *tab_loc_base = &tab_loc[x];
-            for (; x <= end_x - 4 + 1; x += 4) {
-                asm volatile(
-                    "#load from tab_loc and buf_loc\n\t"
-                    "vld1.16 {d0}, [%1]!\n\t"
-                    "vld1.32 {q1}, [%2]!\n\t"
-
-                    "vmov.s16 r1, d0[0]\n\t"
-                    "vmov.s16 r4, d0[1]\n\t"
-                    "vmov.32 r2, d2[0]\n\t"
-                    "add r1, %6, r1, lsl #3\n\t"
-                    "add r4, %6, r4, lsl #3\n\t"
-                    "add r3, %8, r2\n\t"
-                    "add r2, %7, r2\n\t"
-                    "#wtab0 and wtab1\n\t"
-                    "vld1.16 {d4}, [r1]\n\t"
-                    "vmov.32 r1, d2[1]\n\t"
-                    "vld1.16 {d1}, [r4]\n\t"
-                    "add r4, %8, r1\n\t"
-                    "add r1, %7, r1\n\t"
-                    "#point_vec00 and point_vec01\n\t"
-                    "vld1.8 {d6}, [r2]\n\t"
-                    "vld1.8 {d8}, [r3]\n\t"
-                    "#point_vec10 and point_vec10\n\t"
-                    "vld1.8 {d12}, [r1]\n\t"
-                    "vld1.8 {d14}, [r4]\n\t"
-
-                    "vmov.s16 r1, d0[2]\n\t"
-                    "vmov.s16 r4, d0[3]\n\t"
-                    "vmov.32 r2, d3[0]\n\t"
-
-                    "#calculate vec00 and vec01\n\t"
-                    "vmovl.u8 q3, d6\n\t"
-                    "vmovl.u8 q4, d8\n\t"
-                    "#calculate vec10 and vec11\n\t"
-                    "vmovl.u8 q6, d12\n\t"
-                    "vmovl.u8 q7, d14\n\t"
-
-                    "add r1, %6, r1, lsl #3\n\t"
-                    "add r4, %6, r4, lsl #3\n\t"
-                    "add r3, %8, r2\n\t"
-                    "add r2, %7, r2\n\t"
-
-                    "vmull.s16 q10, d6, d4[0]\n\t"
-                    "vmull.s16 q11, d8, d4[2]\n\t"
-                    "vmlal.s16 q10, d7, d4[1]\n\t"
-                    "vmlal.s16 q11, d9, d4[3]\n\t"
-
-                    "#wtab2\n\t"
-                    "vld1.16 {d4}, [r1]\n\t"
-                    "vmov.32 r1, d3[1]\n\t"
-                    "#point_vec20 and point_vec21\n\t"
-                    "vld1.8 {d6}, [r2]\n\t"
-                    "vld1.8 {d8}, [r3]\n\t"
-
-                    "vmull.s16 q12, d12, d1[0]\n\t"
-                    "vmull.s16 q13, d14, d1[2]\n\t"
-                    "vmlal.s16 q12, d13, d1[1]\n\t"
-                    "vmlal.s16 q13, d15, d1[3]\n\t"
-                    "vadd.i32 q10, q11, q10\n\t"
-                    "vadd.i32 q12, q12, q13\n\t"
-
-                    "#wtab3\n\t"
-                    "vld1.16 {d1}, [r4]\n\t"
-                    "add r4, %8, r1\n\t"
-                    "add r1, %7, r1\n\t"
-                    "#point_vec30 and point_vec31\n\t"
-                    "vld1.8 {d12}, [r1]\n\t"
-                    "vld1.8 {d14}, [r4]\n\t"
-
-                    "vadd.i32 q10, q10, %q9\n\t"
-                    "vadd.i32 q12, q12, %q9\n\t"
-                    "vshrn.i32 d20, q10, #15\n\t"
-                    "vshrn.i32 d21, q12, #15\n\t"
-
-                    "#calculate vec20 and vec21\n\t"
-                    "vmovl.u8 q3, d6\n\t"
-                    "vmovl.u8 q4, d8\n\t"
-
-                    "#store results\n\t"
-                    "vmovn.i16 d20, q10\n\t"
-
-                    "#calculate vec30 and vec31\n\t"
-                    "vmovl.u8 q6, d12\n\t"
-                    "vmovl.u8 q7, d14\n\t"
-
-                    "vst1.8 {d20}, [%0]!\n\t"
-
-                    "vmull.s16 q10, d6, d4[0]\n\t"
-                    "vmull.s16 q11, d8, d4[2]\n\t"
-                    "vmlal.s16 q10, d7, d4[1]\n\t"
-                    "vmlal.s16 q11, d9, d4[3]\n\t"
-                    "vmull.s16 q12, d12, d1[0]\n\t"
-                    "vmull.s16 q13, d14, d1[2]\n\t"
-                    "vmlal.s16 q12, d13, d1[1]\n\t"
-                    "vmlal.s16 q13, d15, d1[3]\n\t"
-
-                    "vadd.i32 q10, q11, q10\n\t"
-                    "vadd.i32 q12, q12, q13\n\t"
-                    "vadd.i32 q10, q10, %q9\n\t"
-                    "vadd.i32 q12, q12, %q9\n\t"
-                    "vshrn.i32 d20, q10, #15\n\t"
-                    "vshrn.i32 d21, q12, #15\n\t"
-                    "vmovn.i16 d20, q10\n\t"
-
-                    "vst1.8 {d20}, [%0]!\n\t"
-                    :"=r"(dst_loc),"=r"(tab_loc_base),"=r"(buf_loc_base)
-                    :"0"(dst_loc),"1"(tab_loc_base),"2"(buf_loc_base),"r"(BilinearTab_ptr),"r"(src),"r"(src2),"w"(DELTA_vec)
-                    :"cc","memory","r1","r2","r3","r4","q0","q1","q2","q3","q4","q5","q6","q7","q10","q11","q12","q13"
-                );
-            }
-#endif
             for (; x <= end_x; x++) {
                 int final_loc = final_loc_base + x * 4;
                 int loc_buffer = buf_loc[x];
@@ -1682,171 +1399,19 @@ void warpAffine_linear_uchar(uchar *dst, const uchar *src,
                                 wtab[2] * src2[loc_buffer + 3] +
                                 wtab[3] * src2[loc_buffer + 7];
 
-                dst[final_loc + 0] = saturate_cast<uchar>((val_xy0 + DELTA) >> 15);
-                dst[final_loc + 1] = saturate_cast<uchar>((val_xy1 + DELTA) >> 15);
-                dst[final_loc + 2] = saturate_cast<uchar>((val_xy2 + DELTA) >> 15);
-                dst[final_loc + 3] = saturate_cast<uchar>((val_xy3 + DELTA) >> 15);
+                dst[final_loc + 0] = static_cast<uchar>((val_xy0 + DELTA) >> 15);
+                dst[final_loc + 1] = static_cast<uchar>((val_xy1 + DELTA) >> 15);
+                dst[final_loc + 2] = static_cast<uchar>((val_xy2 + DELTA) >> 15);
+                dst[final_loc + 3] = static_cast<uchar>((val_xy3 + DELTA) >> 15);
             }
         }
 
         delete []buf_loc;
         delete []short_buf;
     }// cn == 4
-    else if (cn == 2) {
-        short *short_buf = new short[outWidth * 2 + outWidth + outWidth + 4];
-        short *xy_loc_buf = short_buf;
-        short *xy_float_buf = xy_loc_buf + 2 * outWidth;
-        short *tab_loc = xy_float_buf + outWidth;
-        const uchar *src2 = src + inWidthStride;
-
-        for (int y = 0; y < outHeight; ++y) {
-            int x_count = 0;
-            int end_x = 0;
-            int final_loc_base = y * outWidthStride;
-
-            int32x4_t off_vec = vdupq_n_s32(16);
-            int16x4_t mask31 = vdup_n_s16(31);
-            int16x8_t mask_mull = {1, 32, 1, 32, 1, 32, 1, 32};
-            int32x4_t bdelta_vec = {bdelta[2*y], bdelta[2*y+1], bdelta[2*y], bdelta[2*y+1]};
-            int idx = 0;
-            for (; idx <= outWidth - 4; idx += 4) { 
-                int32x4_t adelta0 = vaddq_s32(vld1q_s32(adelta + 2 * idx), off_vec);
-                int32x4_t adelta1 = vaddq_s32(vld1q_s32(adelta + 2 * idx + 4), off_vec);
-                //x0y0,x1y1
-                int32x4_t x0y0 = vaddq_s32(adelta0, bdelta_vec);
-                //x2y2,x3y3
-                int32x4_t x2y2 = vaddq_s32(adelta1, bdelta_vec);
-                int16x4_t x0y0sh = vshrn_n_s32(x0y0, 5);
-                int16x4_t x2y2sh = vshrn_n_s32(x2y2, 5);
-                int16x8_t xy_float = vcombine_s16(vand_s16(x0y0sh, mask31), vand_s16(x2y2sh, mask31));
-                xy_float = vmulq_s16(xy_float, mask_mull);
-                int16x8_t xy = vcombine_s16(vshrn_n_s32(x0y0, 10), vshrn_n_s32(x2y2, 10));
-                int16x4_t xy_float0 = vpadd_s16(vget_low_s16(xy_float), vget_high_s16(xy_float));
-                vst1q_s16(xy_loc_buf + idx*2, xy);
-                vst1_s16(xy_float_buf + idx, xy_float0);
-            }
-            for (; idx < outWidth; idx++) { 
-                int new_x = adelta[2 * idx] + bdelta[2 * y] + 16;
-                int new_y = adelta[2 * idx + 1] + bdelta[2 * y + 1] + 16;
-                int new_x_full = new_x >> 5;
-                int new_y_full = new_y >> 5;
-                xy_loc_buf[idx * 2] = (new_x >> 10);
-                xy_loc_buf[idx * 2 + 1] = (new_y >> 10);
-                xy_float_buf[idx] = (new_x_full & 31) + (new_y_full & 31) * 32;
-            }
-            for (int x = 0; x < outWidth; ++x) {
-                int new_x_loc = xy_loc_buf[x * 2];
-                int new_y_loc = xy_loc_buf[x * 2 + 1];
-                int new_xy_float = xy_float_buf[x];
-                short *wtab = BilinearTab_i[new_xy_float][0]; 
-
-                if ( (new_x_loc < inWidth - 1) && (new_y_loc < inHeight - 1) ) {
-                    int final_loc = final_loc_base + x * 2;
-                    int loc_buffer = new_y_loc * inWidthStride + new_x_loc * 2;
-
-                    int val_xy0 = wtab[0] * src[loc_buffer + 0] +
-                                  wtab[1] * src[loc_buffer + 2] +
-                                  wtab[2] * src2[loc_buffer + 0] +
-                                  wtab[3] * src2[loc_buffer + 2];
-                    int val_xy1 = wtab[0] * src[loc_buffer + 1] +
-                                  wtab[1] * src[loc_buffer + 3] +
-                                  wtab[2] * src2[loc_buffer + 1] +
-                                  wtab[3] * src2[loc_buffer + 3];
- 
-                    dst[final_loc + 0] = saturate_cast<uchar>((val_xy0 + DELTA) >> 15);
-                    dst[final_loc + 1] = saturate_cast<uchar>((val_xy1 + DELTA) >> 15);
-                } 
-                else {
-                    if(borderMode == BORDER_TYPE_CONSTANT) {
-                        int loc_buffer = new_y_loc * inWidthStride + new_x_loc * 2;
-                        int final_loc = final_loc_base + x * 2;
-
-                        int mask0 = new_x_loc >= 0 &&
-                                    new_x_loc <= (inWidth - 1) &&
-                                    new_y_loc >= 0 &&
-                                    new_y_loc <= (inHeight - 1);
-
-                        int mask1 = new_x_loc >= -1 &&
-                                    new_x_loc <= (inWidth - 2) &&
-                                    new_y_loc >= 0 &&
-                                    new_y_loc <= (inHeight - 1);
-
-                        int mask2 = new_x_loc >= 0 &&
-                                    new_x_loc <= (inWidth - 1) &&
-                                    new_y_loc >= -1 &&
-                                    new_y_loc <= (inHeight - 2);
-
-                        int mask3 = new_x_loc >= -1 &&
-                                    new_x_loc <= (inWidth - 2) &&
-                                    new_y_loc >= -1 &&
-                                    new_y_loc <= (inHeight - 2);
-
-                        int val_xy0 = 0;
-                        int val_xy1 = 0;
-                        if (mask0) {
-                            val_xy0 += wtab[0] * src[loc_buffer + 0];
-                            val_xy1 += wtab[0] * src[loc_buffer + 1];
-                        } else {
-                            val_xy0 += wtab[0] * borderValue;
-                            val_xy1 += wtab[0] * borderValue;
-                        }
-                        if (mask1) {
-                            val_xy0 += wtab[1] * src[loc_buffer + 2];
-                            val_xy1 += wtab[1] * src[loc_buffer + 3];
-                        } else {
-                            val_xy0 += wtab[1] * borderValue;
-                            val_xy1 += wtab[1] * borderValue;
-                        }
-                        if (mask2) {
-                            val_xy0 += wtab[2] * src2[loc_buffer + 0];
-                            val_xy1 += wtab[2] * src2[loc_buffer + 1];
-                        } else {
-                            val_xy0 += wtab[2] * borderValue;
-                            val_xy1 += wtab[2] * borderValue;
-                        }
-                        if (mask3) {
-                            val_xy0 += wtab[3] * src2[loc_buffer + 2];
-                            val_xy1 += wtab[3] * src2[loc_buffer + 3];
-                        } else {
-                            val_xy0 += wtab[3] * borderValue;
-                            val_xy1 += wtab[3] * borderValue;
-                        }
-
-                        dst[final_loc + 0] = saturate_cast<uchar>((val_xy0 + DELTA) >> 15);
-                        dst[final_loc + 1] = saturate_cast<uchar>((val_xy1 + DELTA) >> 15);
-                    } else if(borderMode == BORDER_TYPE_TRANSPARENT) {
-                        continue;
-                    } else if(borderMode == BORDER_TYPE_REPLICATE) {
-                        int sx0 = clip(new_x_loc, 0, inWidth - 1);
-                        int sy0 = clip(new_y_loc, 0, inHeight - 1);
-                        int sx1 = clip((new_x_loc + 1), 0, inWidth - 1);
-                        int sy1 = clip((new_y_loc + 1), 0, inHeight - 1);
-
-                        int val_xy0 = 
-                            src[sy0 * inWidthStride + sx0 * 2 + 0] * wtab[0] +
-                            src[sy0 * inWidthStride + sx1 * 2 + 0] * wtab[1] +
-                            src[sy1 * inWidthStride + sx0 * 2 + 0] * wtab[2] +
-                            src[sy1 * inWidthStride + sx1 * 2 + 0] * wtab[3];
-
-                        int val_xy1 = 
-                            src[sy0 * inWidthStride + sx0 * 2 + 1] * wtab[0] +
-                            src[sy0 * inWidthStride + sx1 * 2 + 1] * wtab[1] +
-                            src[sy1 * inWidthStride + sx0 * 2 + 1] * wtab[2] +
-                            src[sy1 * inWidthStride + sx1 * 2 + 1] * wtab[3];
-
-                        int final_loc = final_loc_base + x * 2;
-                        dst[final_loc + 0] = saturate_cast<uchar>((val_xy0 + DELTA) >> 15);
-                        dst[final_loc + 1] = saturate_cast<uchar>((val_xy1 + DELTA) >> 15);
-                    }
-                }
-            }
-        }
-        delete []short_buf;
-    }// cn == 2
-
     free(buffer);
-
 }
+
 
 template<>
 ::ppl::common::RetCode WarpAffineNearestPoint<uchar, 1>(
@@ -1861,10 +1426,10 @@ template<>
     assert(affineMatrix != NULL);
     assert(border_type == BORDER_TYPE_CONSTANT || border_type == BORDER_TYPE_TRANSPARENT || border_type == BORDER_TYPE_REPLICATE);
 
-    warpAffine_nearest<uchar>(outData, inData, 
+    warpAffine_nearest<uchar, 1>(outData, inData, 
         inHeight, inWidth, inWidthStride, 
         outHeight, outWidth, outWidthStride, 
-        affineMatrix, 1, border_type, borderValue);
+        affineMatrix, border_type, borderValue);
     return 0;
 }
 
@@ -1881,10 +1446,10 @@ template<>
     assert(affineMatrix != NULL);
     assert(border_type == BORDER_TYPE_CONSTANT || border_type == BORDER_TYPE_TRANSPARENT || border_type == BORDER_TYPE_REPLICATE);
 
-    warpAffine_nearest<uchar>(outData, inData, 
+    warpAffine_nearest<uchar, 3>(outData, inData, 
         inHeight, inWidth, inWidthStride, 
         outHeight, outWidth, outWidthStride, 
-        affineMatrix, 3, border_type, borderValue);
+        affineMatrix, border_type, borderValue);
     return 0;
 }
 
@@ -1901,10 +1466,10 @@ template<>
     assert(affineMatrix != NULL);
     assert(border_type == BORDER_TYPE_CONSTANT || border_type == BORDER_TYPE_TRANSPARENT || border_type == BORDER_TYPE_REPLICATE);
 
-    warpAffine_nearest<uchar>(outData, inData, 
+    warpAffine_nearest<uchar, 4>(outData, inData, 
         inHeight, inWidth, inWidthStride, 
         outHeight, outWidth, outWidthStride, 
-        affineMatrix, 4, border_type, borderValue);
+        affineMatrix, border_type, borderValue);
     return 0;
 }
 
@@ -1987,353 +1552,6 @@ template<>
         affineMatrix, 4, border_type, borderValue);
     return 0;
 }
-
-template<>
-::ppl::common::RetCode WarpAffineLinear_NV12<uchar>(int inHeight,
-                      int inWidth,
-                      int inYStride,
-                      const uchar* yInData,
-                      int inUVStride,
-                      const uchar* uvInData,
-                      int outHeight,
-                      int outWidth,
-                      int outYStride,
-                      uchar* yOutData,
-                      int outUVStride,
-                      uchar* uvOutData,
-                      const float* affineMatrix,
-                      BorderType border_type){
-
-    assert(inHeight > 0 && inWidth > 0 && inYStride >= inWidth);
-    assert(yInData != NULL);
-    assert(inUVStride > 0);
-    assert(uvInData != NULL);
-    assert(outHeight > 0 && outWidth > 0 && outYStride >= outWidth);
-    assert(yOutData != NULL);
-    assert(outUVStride > 0);
-    assert(uvOutData != NULL);
-    assert(affineMatrix != NULL);
-    assert(border_type == BORDER_TYPE_CONSTANT || border_type == BORDER_TYPE_TRANSPARENT || border_type == BORDER_TYPE_REPLICATE);
-
-    float uvAffineMatrix[6];
-    uvAffineMatrix[0] = affineMatrix[0];
-    uvAffineMatrix[1] = affineMatrix[1];
-    uvAffineMatrix[2] = affineMatrix[2] * 0.5f;
-    uvAffineMatrix[3] = affineMatrix[3];
-    uvAffineMatrix[4] = affineMatrix[4];
-    uvAffineMatrix[5] = affineMatrix[5] * 0.5f;
-
-    int src_y_height = inHeight;
-    int src_y_width = inWidth;
-    int src_y_stride = inYStride;
-
-    int src_uv_height = inHeight / 2; 
-    int src_uv_width = inWidth / 2; 
-    int src_uv_stride = inUVStride;
-
-    int dst_y_height = outHeight;
-    int dst_y_width = outWidth;
-    int dst_y_stride = outYStride;
-
-    int dst_uv_height = outHeight / 2; 
-    int dst_uv_width = outWidth / 2; 
-    int dst_uv_stride = outUVStride;
-
-    warpAffine_linear_uchar(yOutData, yInData, 
-        src_y_height, src_y_width, src_y_stride, 
-        dst_y_height, dst_y_width, dst_y_stride, 
-        affineMatrix, 1, border_type, 0);//y border 0
-    warpAffine_linear_uchar(uvOutData, uvInData, 
-        src_uv_height, src_uv_width, src_uv_stride, 
-        dst_uv_height, dst_uv_width, dst_uv_stride, 
-        uvAffineMatrix, 2, border_type, 128);//uv border 128
-    return 0;
-}
-
-template<>
-::ppl::common::RetCode WarpAffineLinear_NV21<uchar>(int inHeight,
-                      int inWidth,
-                      int inYStride,
-                      const uchar* yInData,
-                      int inVUStride,
-                      const uchar* vuInData,
-                      int outHeight,
-                      int outWidth,
-                      int outYStride,
-                      uchar* yOutData,
-                      int outVUStride,
-                      uchar* vuOutData,
-                      const float* affineMatrix,
-                      BorderType border_type) {
-                          
-    WarpAffineLinear_NV12<uchar>(inHeight, inWidth, inYStride, yInData, inVUStride, vuInData,
-                    outHeight, outWidth, outYStride, yOutData, outVUStride, vuOutData,
-                    affineMatrix, border_type);
-    return 0;
-}
-
-template<>
-::ppl::common::RetCode WarpAffineLinear_I420<uchar>(int inHeight,
-    int inWidth,
-    int inYStride,
-    const uchar* yInData,
-    int inUStride,
-    const uchar* uInData,
-    int inVStride,
-    const uchar* vInData,
-    int outHeight,
-    int outWidth,
-    int outYStride,
-    uchar* yOutData,
-    int outUStride,
-    uchar* uOutData,
-    int outVStride,
-    uchar* vOutData,
-    const float* affineMatrix,
-    BorderType border_type){
-
-    assert(inHeight > 0 && inWidth > 0 && inYStride >= inWidth);
-    assert(yInData != NULL);
-    assert(inUStride > 0);
-    assert(vInData != NULL);
-    assert(inVStride > 0);
-    assert(uInData != NULL);
-    assert(outHeight > 0 && outWidth > 0 && outYStride >= outWidth);
-    assert(yOutData != NULL);
-    assert(outUStride > 0);
-    assert(uOutData != NULL);
-    assert(outVStride > 0);
-    assert(vOutData != NULL);
-    assert(affineMatrix != NULL);
-    assert(border_type == BORDER_TYPE_CONSTANT || border_type == BORDER_TYPE_TRANSPARENT || border_type == BORDER_TYPE_REPLICATE);
-    
-    float uvAffineMatrix[6];
-    uvAffineMatrix[0] = affineMatrix[0];
-    uvAffineMatrix[1] = affineMatrix[1];
-    uvAffineMatrix[2] = affineMatrix[2] * 0.5f;
-    uvAffineMatrix[3] = affineMatrix[3];
-    uvAffineMatrix[4] = affineMatrix[4];
-    uvAffineMatrix[5] = affineMatrix[5] * 0.5f;
-
-    int src_y_height = inHeight;
-    int src_y_width = inWidth;
-    int src_y_stride = inYStride;
-
-    int src_u_height = inHeight / 2; 
-    int src_u_width = inWidth / 2; 
-    int src_u_stride = inUStride;
-
-    int src_v_height = inHeight / 2; 
-    int src_v_width  = inWidth / 2; 
-    int src_v_stride = inVStride;
-
-    int dst_y_height = outHeight;
-    int dst_y_width = outWidth;
-    int dst_y_stride = outYStride;
-
-    int dst_u_height = outHeight / 2; 
-    int dst_u_width  = outWidth / 2; 
-    int dst_u_stride = outUStride;
-
-    int dst_v_height = outHeight / 2; 
-    int dst_v_width  = outWidth / 2; 
-    int dst_v_stride = outVStride;
-
-    warpAffine_linear_uchar(yOutData, yInData, 
-        src_y_height, src_y_width, src_y_stride, 
-        dst_y_height, dst_y_width, dst_y_stride, 
-        affineMatrix, 1, border_type, 0);
-    warpAffine_linear_uchar(uOutData, uInData, 
-        src_u_height, src_u_width, src_u_stride, 
-        dst_u_height, dst_u_width, dst_u_stride, 
-        uvAffineMatrix, 1, border_type, 128);
-    warpAffine_linear_uchar(vOutData, vInData, 
-        src_v_height, src_v_width, src_v_stride, 
-        dst_v_height, dst_v_width, dst_v_stride, 
-        uvAffineMatrix, 1, border_type, 128);
-    return 0;
-}
-
-template<>
-::ppl::common::RetCode WarpAffineNearestPoint_NV12<uchar>(int inHeight,
-    int inWidth,
-    int inYStride,
-    const uchar* yInData,
-    int inUVStride,
-    const uchar* uvInData,
-    int outHeight,
-    int outWidth,
-    int outYStride,
-    uchar* yOutData,
-    int outUVStride,
-    uchar* uvOutData,
-    const float* affineMatrix,
-    BorderType border_type) {
-
-    assert(inHeight > 0 && inWidth > 0 && inYStride >= inWidth);
-    assert(yInData != NULL);
-    assert(inUVStride > 0);
-    assert(uvInData != NULL);
-    assert(outHeight > 0 && outWidth > 0 && outYStride >= outWidth);
-    assert(yOutData != NULL);
-    assert(outUVStride > 0);
-    assert(uvOutData != NULL);
-    assert(affineMatrix != NULL);
-    assert(border_type == BORDER_TYPE_CONSTANT || border_type == BORDER_TYPE_TRANSPARENT || border_type == BORDER_TYPE_REPLICATE);
-
-    float uvAffineMatrix[6];
-    uvAffineMatrix[0] = affineMatrix[0];
-    uvAffineMatrix[1] = affineMatrix[1];
-    uvAffineMatrix[2] = affineMatrix[2] * 0.5f;
-    uvAffineMatrix[3] = affineMatrix[3];
-    uvAffineMatrix[4] = affineMatrix[4];
-    uvAffineMatrix[5] = affineMatrix[5] * 0.5f;
-
-    int src_y_height = inHeight;
-    int src_y_width = inWidth;
-    int src_y_stride = inYStride;
-
-    int src_uv_height = inHeight / 2; 
-    int src_uv_width = inWidth / 2; 
-    int src_uv_stride = inUVStride;
-
-    int dst_y_height = outHeight;
-    int dst_y_width = outWidth;
-    int dst_y_stride = outYStride;
-
-    int dst_uv_height = outHeight / 2; 
-    int dst_uv_width = outWidth / 2; 
-    int dst_uv_stride = outUVStride;
-
-     warpAffine_nearest<uchar>(yOutData, yInData, 
-        src_y_height, src_y_width, src_y_stride, 
-        dst_y_height, dst_y_width, dst_y_stride, 
-        affineMatrix, 1, border_type, 0);
-    warpAffine_nearest<uchar>(uvOutData, uvInData, 
-        src_uv_height, src_uv_width, src_uv_stride, 
-        dst_uv_height, dst_uv_width, dst_uv_stride, 
-        uvAffineMatrix, 2, border_type, 128);
-    return 0;
-}
-
-template<>
-::ppl::common::RetCode WarpAffineNearestPoint_NV21<uchar>(int inHeight,
-    int inWidth,
-    int inYStride,
-    const uchar* yInData,
-    int inVUStride,
-    const uchar* vuInData,
-    int outHeight,
-    int outWidth,
-    int outYStride,
-    uchar* yOutData,
-    int outVUStride,
-    uchar* vuOutData,
-    const float* affineMatrix,
-    BorderType border_type){
-
-    WarpAffineNearestPoint_NV12<uchar>(inHeight,
-        inWidth,
-        inYStride,
-        yInData,
-        inVUStride,
-        vuInData,
-        outHeight,
-        outWidth,
-        outYStride,
-        yOutData,
-        outVUStride,
-        vuOutData,
-        affineMatrix,
-        border_type);
-    return 0;
-}
-
-template<>
-::ppl::common::RetCode WarpAffineNearestPoint_I420<uchar>(int inHeight,
-    int inWidth,
-    int inYStride,
-    const uchar* yInData,
-    int inUStride,
-    const uchar* uInData,
-    int inVStride,
-    const uchar* vInData,
-    int outHeight,
-    int outWidth,
-    int outYStride,
-    uchar* yOutData,
-    int outUStride,
-    uchar* uOutData,
-    int outVStride,
-    uchar* vOutData,
-    const float* affineMatrix,
-    BorderType border_type){
-
-    assert(inHeight > 0 && inWidth > 0 && inYStride >= inWidth);
-    assert(yInData != NULL);
-    assert(inUStride > 0);
-    assert(uInData != NULL);
-    assert(inVStride > 0);
-    assert(vInData != NULL);
-    assert(outHeight > 0 && outWidth > 0 && outYStride >= outWidth);
-    assert(yOutData != NULL);
-    assert(outUStride > 0);
-    assert(uOutData != NULL);
-    assert(outVStride > 0);
-    assert(vOutData != NULL);
-    assert(affineMatrix != NULL);
-    assert(border_type == BORDER_TYPE_CONSTANT || border_type == BORDER_TYPE_TRANSPARENT || border_type == BORDER_TYPE_REPLICATE);
-
-    float uvAffineMatrix[6];
-    uvAffineMatrix[0] = affineMatrix[0];
-    uvAffineMatrix[1] = affineMatrix[1];
-    uvAffineMatrix[2] = affineMatrix[2] * 0.5f;
-    uvAffineMatrix[3] = affineMatrix[3];
-    uvAffineMatrix[4] = affineMatrix[4];
-    uvAffineMatrix[5] = affineMatrix[5] * 0.5f;
-
-    int src_y_height = inHeight;
-    int src_y_width  = inWidth;
-    int src_y_stride = inYStride;
-
-    int src_u_height = inHeight / 2; 
-    int src_u_width  = inWidth / 2; 
-    int src_u_stride = inUStride;
-
-    int src_v_height = inHeight / 2; 
-    int src_v_width  = inWidth / 2; 
-    int src_v_stride = inVStride;
-
-    int dst_y_height = outHeight;
-    int dst_y_width  = outWidth;
-    int dst_y_stride = outYStride;
-
-    int dst_u_height = outHeight / 2; 
-    int dst_u_width  = outWidth / 2; 
-    int dst_u_stride = outUStride;
-
-    int dst_v_height = outHeight / 2; 
-    int dst_v_width  = outWidth / 2; 
-    int dst_v_stride = outVStride;
-
-    warpAffine_nearest<uchar>(yOutData, yInData, 
-        src_y_height, src_y_width, src_y_stride, 
-        dst_y_height, dst_y_width, dst_y_stride, 
-        affineMatrix, 1, border_type, 0);
-
-    warpAffine_nearest<uchar>(uOutData, uInData,
-        src_u_height, src_u_width, src_u_stride,
-        dst_u_height, dst_u_width, dst_u_stride,
-        uvAffineMatrix, 1, border_type, 128);
-
-    warpAffine_nearest<uchar>(vOutData, vInData,
-        src_v_height, src_v_width, src_v_stride,
-        dst_v_height, dst_v_width, dst_v_stride,
-        uvAffineMatrix, 1, border_type, 128);
-    return 0;
-}
-
-
 
 }
 }

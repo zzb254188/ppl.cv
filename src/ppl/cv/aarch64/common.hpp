@@ -17,5 +17,16 @@ inline void prefetch(const void *ptr, size_t offset = 1024)
 #endif
 }
 
+static inline void prefetch_range(const void *addr, size_t len)
+{
+#ifdef ARCH_HAS_PREFETCH
+char *cp;
+char *end = addr + len;
+
+for (cp = addr; cp < end; cp += PREFETCH_STRIDE)
+__builtin_prefetch(cp);
+#endif
+}
+
 }}}//ppl::cv::aarch64
 #endif

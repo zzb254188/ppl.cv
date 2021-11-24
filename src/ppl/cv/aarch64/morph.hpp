@@ -85,11 +85,11 @@ void morph_f32(
     const int32_t height,
     const int32_t width,
     int32_t srcStride,
-    const float *srcBase,
+    const float32_t *srcBase,
     int32_t dstStride,
-    float *dstBase,
+    float32_t *dstBase,
     BorderType border_type = BORDER_TYPE_CONSTANT,
-    float borderValue      = 0);
+    float32_t borderValue      = 0);
 }
 }
 } // namespace ppl::cv::aarch64

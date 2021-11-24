@@ -22,6 +22,7 @@
 #include <memory>
 #include <gtest/gtest.h>
 #include "ppl/cv/debug.h"
+#include <iostream>
 
 template<typename T, int val>
 static void randomRangeData(T *data, const size_t num,int maxNum =255){
@@ -57,7 +58,8 @@ public:
         std::unique_ptr<T[]> dst(new T[width * height * nc]);
         std::unique_ptr<uchar[]> kernel(new uchar[kernel_size * kernel_size]);
         ppl::cv::debug::randomFill<T>(src.get(), width * height * nc, 0, 255);
-        ppl::cv::debug::randomFill<T>(dst_ref.get(), width * height * nc, 0, 255);
+        ppl::cv::debug::randomFill<T>(dst.get(), width * height * nc, 1, 1);
+        ppl::cv::debug::randomFill<T>(dst_ref.get(), width * height * nc, 1, 1);
         ppl::cv::debug::randomFill<uchar>(kernel.get(), kernel_size * kernel_size, 1, 1);
         memcpy(dst.get(), dst_ref.get(), width * height * nc * sizeof(T));
         cv::Mat src_opencv(height, width, CV_MAKETYPE(cv::DataType<T>::depth, nc), src.get(), sizeof(T) * width * nc);
@@ -83,6 +85,25 @@ public:
             (ppl::cv::BorderType)borderType,
             border_value);
 
+        
+        // for(int i = 0 ; i < height; i++){
+        //     for (int j = 0; j < width * nc; j++){
+        //         if (*(dst.get() + i * width * nc + j) != *(dst_ref.get() + i * width * nc + j))
+        //             std::cout << i <<"," << j << std::endl;
+        //         // std::cout << *(dst.get() + i * width * nc + j) << " ";
+        //     }
+        //     // std::cout<<std::endl;   
+        // }
+
+        // std::cout<<std::endl;   
+        // for(int i = 0 ; i < height; i++){
+        //     for (int j = 0; j < width * nc; j++){
+        //         std::cout << static_cast<int>(*(dst_ref.get() + i * width * nc + j)) << " ";
+        //     }
+        //     std::cout<<std::endl;   
+        // }
+
+
         checkResult<T, nc>(
             dst_ref.get(),
             dst.get(),
@@ -101,18 +122,17 @@ public:
         this->apply(GetParam());\
     }\
     INSTANTIATE_TEST_CASE_P(standard, name,\
-        ::testing::Combine(::testing::Values(320, 240), \
-                           ::testing::Values(480, 640), \
-                           ::testing::Values(3, 5, 7), \
+        ::testing::Combine(::testing::Values(240, 241, 242, 243,244,245,246,247,248,249,250,251,252,253,254), \
+                           ::testing::Values(10), \
+                           ::testing::Values(3, 5), \
                            ::testing::Values(ppl::cv::BORDER_TYPE_CONSTANT, ppl::cv::BORDER_TYPE_REFLECT,\
                                              ppl::cv::BORDER_TYPE_REFLECT101, ppl::cv::BORDER_TYPE_REPLICATE),\
                            ::testing::Values(diff)));
 
-R1(Dilate_f8c1, float, 1, 1.01)
-R1(Dilate_f8c3, float, 3, 1.01)
-R1(Dilate_f8c4, float, 4, 1.01)
+R1(Dilate_f32c1, float, 1, 1.01)
+R1(Dilate_f32c3, float, 3, 1.01)
+R1(Dilate_f32c4, float, 4, 1.01)
 
-// R1(Dilate_u8c1, uint8_t, 1, 1.01)
-// R1(Dilate_u8c2, uint8_t, 2, 1.01)
-// R1(Dilate_u8c3, uint8_t, 3, 1.01)
-// R1(Dilate_u8c4, uint8_t, 4, 1.01)
+R1(Dilate_u8c1, uint8_t, 1, 1.01)
+R1(Dilate_u8c3, uint8_t, 3, 1.01)
+R1(Dilate_u8c4, uint8_t, 4, 1.01)
